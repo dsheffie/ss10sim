@@ -1,6838 +1,1395 @@
-#include <cassert>
-#include <cmath>
-#include <cfenv>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
-#include <unordered_map>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/time.h>
-#include <sys/times.h>
-#include <sys/mman.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/uio.h>
-#include <sys/utsname.h>
-
+#include <cmath>
+#include <cfenv>
+#include <iostream>
+#include <iomanip>
 
 #include "interpret.hh"
-#include "interrupt.hh"
-#include "sgi_hpc.hh"
-#include "sgi_mc.hh"
-#include "sgi_newport.hh"
-#include "sgi_scc.hh"
-#include "sclog.hh"
-#include "disassemble.hh"
+#include "sun4m.hh"
 #include "helper.hh"
 #include "globals.hh"
-#include "inst_record.hh"
 
-/* Berkeley SoftFloat-3 (vendored in ./softfloat) -- bit-exact IEEE-754 that
- * honors the FCSR rounding mode explicitly.  The host FPU can't be trusted for
- * this: GCC ignores runtime fesetround for the raw +,-,* operators even with
- * -frounding-math, so add/sub/mul silently rounded to nearest regardless of RM,
- * corrupting anything that sets a non-default mode (e.g. libc's %f dtoa). */
-extern "C" {
-#include "softfloat/source/include/softfloat.h"
-}
-
-/* host double/float <-> softfloat bit-container (pure reinterpret, no rounding) */
-static inline float64_t d2sf(double d)  { float64_t f; std::memcpy(&f.v, &d, 8); return f; }
-static inline double    sf2d(float64_t f){ double d;    std::memcpy(&d, &f.v, 8); return d; }
-static inline float32_t s2sf(float s)   { float32_t f; std::memcpy(&f.v, &s, 4); return f; }
-static inline float     sf2s(float32_t f){ float s;     std::memcpy(&s, &f.v, 4); return s; }
-
-/* NANWATCH helpers: a NaN in either MIPS FP format.  cpr1[] holds singles in
- * bits[31:0] (FR=1), so the format must come from cpr1_state[] or the opcode. */
-static inline bool fp_is_nan(uint64_t v, bool dbl) {
-  if(dbl) {
-    return ((v & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL) &&
-           ((v & 0x000fffffffffffffULL) != 0);
-  }
-  uint32_t w = static_cast<uint32_t>(v);
-  return ((w & 0x7f800000u) == 0x7f800000u) && ((w & 0x007fffffu) != 0);
-}
-
-static inline double fp_as_double(uint64_t v, bool dbl) {
-  if(dbl) {
-    double d; std::memcpy(&d, &v, 8); return d;
-  }
-  float f; uint32_t w = static_cast<uint32_t>(v); std::memcpy(&f, &w, 4);
-  return static_cast<double>(f);
-}
-
-/* ---- NANWATCH taint calculus -------------------------------------------
- * A NaN is tagged with its ORIGIN and that tag is carried through every FP
- * value copy -- register to register, through memory via sdc1/ldc1, and
- * through arithmetic.  The domain is deliberately tiny: only NaN values carry
- * a tag, so until the first NaN appears there is nothing to track and the
- * shadow map stays empty (one predictable branch per FP memory op).
+/* SPARC V8 golden ISS.  References: The SPARC Architecture Manual, Version 8
+ * (chapters 4-7 and appendix B).  Mapping onto the r9999 pipeline and the open
+ * design decisions live in SPARC_V8_PLAN.md.
  *
- * Origin kinds:
- *   ARITH -- an FP arithmetic op produced a NaN from non-NaN operands.  This
- *            is a genuine IEEE invalid and the buck stops here.
- *   EXTERN -- a NaN arrived by a load or a GPR->FPR move from memory we never
- *            saw an FP store write.  On perfect hardware running a program
- *            that computes no NaN, this is the FABRICATION signature: the
- *            value did not come from any FP computation we observed.
- * PROPAGATED values keep the tag of the root they came from, so reporting the
- * tag at the point of use names the ORIGIN, not the last hop. */
-struct nan_taint_t {
-  uint64_t icnt = 0;
-  uint32_t pc = 0;
-  uint32_t inst = 0;
-  uint64_t addr = 0;   /* for an EXTERN origin from a load: the address it came from */
-  uint8_t  kind = 0;   /* 0 = untainted, 1 = ARITH, 2 = EXTERN */
-};
-static nan_taint_t g_ftaint[32];
-static std::unordered_map<uint64_t, nan_taint_t> g_mtaint;   /* FP stores of tainted values, by VA */
+ * Memory model: SPARC Reference MMU (sun4m, Viking flavor) walked on every
+ * access -- no TLB, so TLB flushes are no-ops.  No caches are modeled. */
 
-static const char *nan_kind_name(uint8_t k) {
-  return (k == 1) ? "ARITH" : (k == 2) ? "EXTERN" : "none";
+#pragma STDC FENV_ACCESS ON
+
+static const uint32_t NO_TRAP = ~0u;
+
+state_t::~state_t() {}
+
+uint32_t state_t::get_psr() const {
+  /* EC (bit 13) is hardwired 0: no coprocessor */
+  return (PSR_IMPL_VER << 24) |
+    (static_cast<uint32_t>(icc_n) << 23) |
+    (static_cast<uint32_t>(icc_z) << 22) |
+    (static_cast<uint32_t>(icc_v) << 21) |
+    (static_cast<uint32_t>(icc_c) << 20) |
+    (static_cast<uint32_t>(ef) << 12) |
+    (pil << 8) |
+    (static_cast<uint32_t>(s) << 7) |
+    (static_cast<uint32_t>(ps) << 6) |
+    (static_cast<uint32_t>(et) << 5) |
+    cwp;
 }
 
-/* MIPS FCSR.RM (0=RN,1=RZ,2=RP/+inf,3=RM/-inf) -> SoftFloat rounding mode
- * (0=near_even,1=minMag,2=min/-inf,3=max/+inf).  Note RP/RM swap. */
-static inline void sf_set_rm(state_t *s) {
-  static const uint_fast8_t m[4] = { softfloat_round_near_even, softfloat_round_minMag,
-                                     softfloat_round_max, softfloat_round_min };
-  softfloat_roundingMode = m[ s->fcr1[CP1_CR31] & 3u ];
+void state_t::set_psr(uint32_t v) {
+  icc_n = (v >> 23) & 1;
+  icc_z = (v >> 22) & 1;
+  icc_v = (v >> 21) & 1;
+  icc_c = (v >> 20) & 1;
+  ef = (v >> 12) & 1;
+  pil = (v >> 8) & 15;
+  s = (v >> 7) & 1;
+  ps = (v >> 6) & 1;
+  et = (v >> 5) & 1;
+  cwp = v & 31;
 }
-/* overloaded so execFP<T,op> resolves f32/f64 by the operand type; caller sets RM. */
-/* FP_NATIVE: do the arithmetic with the HOST x86 FPU instead of SoftFloat.
- * Differential knob only -- it is NOT MIPS-conformant (host rounding mode, x86
- * NaN payloads), but if a failure survives the switch then the arithmetic
- * implementation is exonerated and the fault lies elsewhere. */
-static const bool g_fp_native = getenv("FP_NATIVE") != nullptr;
-static inline double sf_add(double a,double b){ return g_fp_native ? (a+b) : sf2d(f64_add(d2sf(a),d2sf(b))); }
-static inline float  sf_add(float  a,float  b){ return g_fp_native ? (a+b) : sf2s(f32_add(s2sf(a),s2sf(b))); }
-static inline double sf_sub(double a,double b){ return g_fp_native ? (a-b) : sf2d(f64_sub(d2sf(a),d2sf(b))); }
-static inline float  sf_sub(float  a,float  b){ return g_fp_native ? (a-b) : sf2s(f32_sub(s2sf(a),s2sf(b))); }
-static inline double sf_mul(double a,double b){ return g_fp_native ? (a*b) : sf2d(f64_mul(d2sf(a),d2sf(b))); }
-static inline float  sf_mul(float  a,float  b){ return g_fp_native ? (a*b) : sf2s(f32_mul(s2sf(a),s2sf(b))); }
-static inline double sf_div(double a,double b){ return g_fp_native ? (a/b) : sf2d(f64_div(d2sf(a),d2sf(b))); }
-static inline float  sf_div(float  a,float  b){ return g_fp_native ? (a/b) : sf2s(f32_div(s2sf(a),s2sf(b))); }
-static inline double sf_sqrtf(double a){ return g_fp_native ? __builtin_sqrt(a)  : sf2d(f64_sqrt(d2sf(a))); }
-static inline float  sf_sqrtf(float  a){ return g_fp_native ? __builtin_sqrtf(a) : sf2s(f32_sqrt(s2sf(a))); }
-
-static fpMode currFpMode = fpMode::mips3;  /* IRIX N32 = MIPS-III, FR=1 flat 64-bit FP regs (odd regs legal, no fd+1 pairing) */
-
-state_t::~state_t() {
-  //std::cout << mem.bytes_allocated() << " bytes present in memory image\n";
-  //delete &mem; // mem owned by caller (main.cc deletes the sparse_mem)
-}
-
-static void execCoproc0(uint32_t inst, state_t *s);
-static void execCoproc2(uint32_t inst, state_t *s);
-
-/* DBG instantiates the per-instruction debug/trace hooks (the getenv knobs below,
- * --retiretrace, PCTRACE).  globals::exec_dbg (set once in main) picks the instance;
- * the DBG=false one carries none of them.  See exec_debug_requested(). */
-template <bool EL, bool DBG> void execMips(state_t *s);
-
-void execMips(state_t *s) {
-  if(globals::exec_dbg) {
-    execMips<IS_LITTLE_ENDIAN, true>(s);
-  }
-  else {
-    execMips<IS_LITTLE_ENDIAN, false>(s);
-  }
-}
-
-void execMipsFast(state_t *s) {
-  execMips<IS_LITTLE_ENDIAN, false>(s);
-}
-
-/* any per-instruction debug knob set?  (the env-gated blocks in execMips' DBG instance) */
-bool exec_debug_requested() {
-  static const char *knobs[] = {"DISPROBE", "RETLO", "FPTRAPCOUNT", "NANWATCH", "PCHASH",
-                                "PCDUMP", "ASIDPC"};
-  for(const char *k : knobs) {
-    if(getenv(k) != nullptr) {
-      return true;
-    }
-  }
-  return false;
-}
-
-static const bool g_cache_dbg = getenv("CACHEDBG") != nullptr;
-
-uint64_t sext64(uint32_t x) {
-  int64_t xx = static_cast<int64_t>(x);
-  return (xx << 32) >> 32;
-}
-
-#if 1
-std::ostream &operator<<(std::ostream &out, const state_t & s) {
-  using namespace std;
-  for(int i = 0; i < 32; i++) {
-    out << getGPRName(i) << " : 0x"
-	<< hex << s.gpr[i] << dec
-	<< "(" << s.gpr[i] << ")\n";
-  }
-#if 0
-  for(int i = 0; i < 32; i++) {
-    out << "cpr0_" << i << " : 0x"
-	<< hex << s.cpr0[i] << dec
-	<< "\n";
-  }
-  for(int i = 0; i < 32; i++) {
-    out << "cpr1_" << i << " : 0x"
-	<< hex << s.cpr1[i] << dec
-	<< "\n";
-  }
-  for(int i = 0; i < 5; i++) {
-    out << "fcr" << i << " : 0x"
-	<< hex << s.fcr1[i] << dec
-	<< "\n";
-  }
-#endif
-  out << "icnt : " << s.icnt << "\n";
-  return out;
-}
-#endif
-
-static uint32_t getConditionCode(state_t *s, uint32_t cc);
-static void setConditionCode(state_t *s, uint32_t v, uint32_t cc);
-
-
-/* IType instructions */
-static void _lb(uint32_t inst, state_t *s);
-static void _lbu(uint32_t inst, state_t *s);
-static void _sb(uint32_t inst, state_t *s);
-
-
-static void _mtc1(uint32_t inst, state_t *s);
-static void _mfc1(uint32_t inst, state_t *s);
-
-static void _sc(uint32_t inst, state_t *s);
-
-/* FLOATING-POINT */
-static void _c(uint32_t inst, state_t *s);
-
-static void _cvts(uint32_t inst, state_t *s);
-static void _cvtd(uint32_t inst, state_t *s);
-
-static void _truncw(uint32_t inst, state_t *s);
-static void _truncl(uint32_t inst, state_t *s);
-
-static void _movci(uint32_t inst, state_t *s);
-
-static void _fmovc(uint32_t inst, state_t *s);
-static void _fmovn(uint32_t inst, state_t *s);
-static void _fmovz(uint32_t inst, state_t *s);
-
-
-static void _movcs(uint32_t inst, state_t *s);
-static void _movcd(uint32_t inst, state_t *s);
-
-static void _movnd(uint32_t inst, state_t *s);
-static void _movns(uint32_t inst, state_t *s);
-static void _movzd(uint32_t inst, state_t *s);
-static void _movzs(uint32_t inst, state_t *s);
 
 void initState(state_t *s) {
-  /* Matches the RTL's cpr0_status_reg reset in exec.sv: CU1 resets 0 (R/W,
-   * lazy-FPU) -- FP is enabled by the OS on the first-use CpU trap, NOT at reset. */
-  s->cpr0[CPR0_SR] |= SR_ERL | SR_BEV | SR_CU0 | SR_CU2;
-  xctx_update(s);
-  /* Random starts at max TLB index; it cycles downward to Wired */
-  s->cpr0[CPR0_RANDOM] = state_t::NUM_TLB_ENTRIES - 1;
-  /* PRId: read-only processor id (R4000 family for now) */
-  { const char *pe = getenv("PRID"); uint32_t pv = pe ? (uint32_t)strtoull(pe,0,0) : (globals::cpu_r5000 ? PRID_R5000 : PRID_VALUE);
-    s->cpr0[CPR0_PRID] = pv; s->cpr0_64[CPR0_PRID] = pv; }
-  /* Config: R4600 cache geometry (16 KB I$ + 16 KB D$, 32-byte lines, K0=3),
-   * matching the real SGI Indy / MAME. mlreset derives cachecolormask from this;
-   * the r9999 RTL's 0x00088200 gives the wrong mask and pagecoloralign loops
-   * forever (MAME co-sim, MAME_QUESTIONS.md Q5 round-2). */
-  /* CP0CONFIG=<hex> overrides this.  Needed for the FPGA-vs-interp boot-trace diff:
-   * the RTL reports a 16-byte D-cache line (Config DB=0) while the default above says
-   * 32 (DB=1), so cpu_probe's software CLZ over Config takes a different branch and the
-   * streams diverge ~149k insns in.  Use CP0CONFIG=0x0002e4a3 to match the RTL.
-   * Do NOT change the default -- IRIX needs the Indy/MAME geometry (see above).
-   * --cpu r5000: same word with IC=DC=3 (32 KB each, 2-way on the R5000), still
-   * SC=1 (no secondary cache: the R5000PC Indy, SPEC95's "no L2" machine). */
-  { const char *ce = getenv("CP0CONFIG");
-    uint32_t cv = ce ? (uint32_t)strtoull(ce, 0, 0) : (globals::cpu_r5000 ? 0x0002e6f3u : 0x0002e4b3u);
-    /* SCSIZE=<bytes>: claim a secondary cache (Config.SC=0) so IRIX sizes it and
-     * issues SD cache ops; SCLINE=<16|32|64|128> sets Config.SB (default 16).  The
-     * ISS has no caches: SD ops are only logged (SCLOG) and the tag ops emulated
-     * well enough for size_2nd_cache's probe. */
-    if(getenv("SCSIZE")) {
-      uint32_t ln = getenv("SCLINE") ? (uint32_t)strtoul(getenv("SCLINE"), 0, 0) : 16;
-      uint32_t sb = (ln >= 128) ? 3 : (ln >= 64) ? 2 : (ln >= 32) ? 1 : 0;
-      cv = (cv & ~((1u << 17) | (3u << 22))) | (sb << 22);
-    }
-    s->cpr0[CPR0_CONFIG] = cv;
-    s->cpr0_64[CPR0_CONFIG] = cv; }
-}
-
-/* Raise MIPS Reserved Instruction exception (ExcCode=10).
- * Called by the interpreter when it encounters an unimplemented opcode.
- * Sets EPC/Cause/Status and redirects the interpreter to the exception
- * vector so execution follows the bare-metal exc_handler path. */
-/* Sign-extend a 32-bit value to 64-bit, matching MIPS hardware behaviour
- * for registers and PC values where bit 31 indicates kernel address space. */
-static inline state_t::reg_t sext32(uint32_t v) {
-  return (state_t::reg_t)(int64_t)(int32_t)v;
-}
-
-/* Set EPC + Cause.BD for an exception, accounting for the branch-delay-slot case
- * (EPC = branch pc = pc-4, BD=1); matches the RTL.  Call before the ExcCode write
- * (which preserves BD by masking only bits [6:2]). */
-static inline void set_exc_pc(state_t *s) {
-  /* R4000: EPC (and Cause.BD) are updated ONLY if Status.EXL==0 at the time of the
-   * exception. On a nested exception (EXL already set) they are preserved — so the
-   * eventual eret returns to the ORIGINAL faulting instruction, not the nested
-   * handler. (This is load-bearing for IRIX's self-mapped page-table refill: a
-   * nested TLB miss in the 0x80000000 refill handler must leave EPC = the original
-   * access, so retrying it re-runs the whole refill once the PT page is mapped.) */
-  if(s->cpr0[CPR0_SR] & SR_EXL)
-    return;
-  /* EPC is a 64-bit register on R4000; keep the 32-bit (cpr0) and 64-bit
-   * (cpr0_64) views consistent.  Linux's exception entry saves EPC via
-   * `dmfc0 c0_epc` (reads cpr0_64) and restore_partial reloads it via
-   * `dmtc0`, then erets -- so leaving cpr0_64[EPC] stale made eret return to
-   * 0.  (IRIX read EPC via mfc0/eret, the 32-bit view, so it masked this.) */
-  if(s->in_delay_slot) {
-    s->cpr0[CPR0_EPC]    = (uint32_t)(s->pc - 4);
-    s->cpr0_64[CPR0_EPC] = (uint64_t)(s->pc - 4);
-    s->cpr0[CPR0_CAUSE] |=  (1u << 31);
-  } else {
-    s->cpr0[CPR0_EPC]    = (uint32_t)s->pc;
-    s->cpr0_64[CPR0_EPC] = (uint64_t)s->pc;
-    s->cpr0[CPR0_CAUSE] &= ~(1u << 31);
+  /* V8 reset: PC=0, nPC=4, S=1, ET=0.  load_elf overrides pc/npc. */
+  s->s = true;
+  s->et = false;
+  s->ef = true;
+  s->cwp = 0;
+  s->wim = 0;
+  if(s->user_emu) {
+    /* a fresh Linux process: user mode, traps on, one valid window (CWP); the
+     * window above it is the invalid one, so the first RESTORE past _start
+     * underflows and N-1 SAVEs fit before the first spill */
+    s->s = false;
+    s->ps = false;
+    s->et = true;
+    s->wim = 1u << ((s->cwp + 1) % NWINDOWS);
   }
 }
 
-/* R4000 exception vector selection.
- *   BEV=1 (bootstrap): base 0xBFC00200 (uncached ROM); refill 0x000, XTLB 0x080,
- *          general/all-others 0x180  ->  refill 0xBFC00200, general 0xBFC00380.
- *   BEV=0 (kernel installed handlers): base 0x80000000; TLB refill 0x000,
- *          XTLB 0x080, general/all-others 0x180.
- * The dedicated TLB-refill (TLBL/TLBS) vector at offset 0x000 (or XTLB 0x080) is
- * used ONLY when the exception is a TLB Refill (no matching entry) AND EXL==0 at
- * the time of the fault; otherwise (EXL already set, or any non-refill cause) the
- * general vector at 0x180 is used.  is_xtlb selects the 64-bit-addressing XTLB
- * refill slot. */
-static inline uint32_t exc_vector(state_t *s, bool is_refill, bool exl_was_set,
-                                  bool is_xtlb) {
-  uint32_t base   = (s->cpr0[CPR0_SR] & SR_BEV) ? 0xBFC00200u : 0x80000000u;
-  uint32_t offset = 0x180u;
-  if(is_refill && !exl_was_set)
-    offset = is_xtlb ? 0x080u : 0x000u;
-  return base + offset;
-}
-
-/* Common tail for a synchronous exception: write Cause.ExcCode, set EXL (clearing
- * ERL), and vector.  set_exc_pc() (EPC + Cause.BD) must already have run. */
-static inline void raise_common(state_t *s, uint32_t exccode) {
-  bool exl_was_set = (s->cpr0[CPR0_SR] & SR_EXL) != 0;
-  s->cpr0[CPR0_CAUSE] = (s->cpr0[CPR0_CAUSE] & ~(0x1fu << 2)) | (exccode << 2);
-  s->cpr0[CPR0_SR]    = (s->cpr0[CPR0_SR] & ~SR_ERL) | SR_EXL;
-  xctx_update(s);
-  s->ll_armed = false;   /* any exception breaks the load-linked reservation */
-  s->pc = sext32(exc_vector(s, /*is_refill=*/false, exl_was_set, /*xtlb=*/false));
-}
-
-/* CP0 Count/Compare timer + interrupt delivery (R4000 internal timer, the IP22
- * Linux clocksource/clockevent).  Called once per instruction step from the main
- * loop.  Count advances; Count==Compare sets Cause.IP[7] (timer pending).  An Int
- * exception (ExcCode 0) is taken at this instruction boundary when an enabled,
- * unmasked interrupt is pending: IE=1, EXL=0, ERL=0, (Cause.IP & Status.IM) != 0.
- * The kernel's timer ISR re-arms by writing Compare (which clears IP[7]; see the
- * MTC0 handler). */
-/* How often to run the (relatively expensive) IOC2/INT2 device-interrupt poll +
- * delivery. Must be a power of two. IP2's sources are level-sensitive (stay
- * asserted until serviced), so polling every INT_POLL instructions only adds at
- * most that many instructions of delivery latency -- negligible for a functional
- * ISS -- while keeping ioc2_ip2_pending() (ioc2_local0_live + int_pending, ~10%
- * of run time when recomputed every instruction) off the hot path. NB: the SCC
- * TX drain (scc->tick) must stay exact every instruction -- the early PROM
- * banner uses polled serial whose RR0 wait depends on the per-instruction drain
- * timing, so throttling tick() hangs the boot. TODO: once every device is
- * modeled, replace this poll with a device-sets-a-flag scheme (the "right way"). */
-static const uint64_t INT_POLL = getenv("INT_POLL") ? strtoull(getenv("INT_POLL"),0,0) : 64;
-const uint64_t g_int_poll = INT_POLL;   /* interrupt.hh's inline per-instruction path */
-uint64_t g_next_poll_icnt = 0;
-
-/* env-gated TLB/timer tally (TLBTALLY=1): compare against the FPGA bad-istack trigger */
-static uint64_t g_ty_timer=0, g_ty_tlbmiss=0, g_ty_idle_tlbmiss=0, g_ty_timer_in_tlbmiss=0, g_ty_timer_idle=0, g_ty_pda_miss=0;
-static inline bool ty_in_tlbmiss(uint32_t pc){ return pc>=0x880196bcu && pc<=0x880196e0u; }
-static inline bool ty_idle_sp(uint32_t sp){ return (sp & 0xfffff000u)==0x8834a000u; }
-/* R4400 PageMask encodings: 4K 16K 64K 256K 1M 4M 16M (huge pages use 1M pairs) */
-/* TLBPMSTATS: histogram of tlbwi/tlbwr by page size (PageMask), split user (EntryHi VA
- * below 0x80000000) vs kernel.  Answers "is IRIX really mapping large pages" (dplace
- * -data_pagesize).  Printed by tlbpm_report() on SIGUSR1. */
-static const bool g_tlbpm_on = getenv("TLBPMSTATS") != nullptr;
-static uint64_t g_tlbpm[2][7];
-static void tlbpm_count(uint64_t entry_hi, uint32_t pm) {
-  uint32_t sz = __builtin_popcount(pm >> 13) / 2;   /* 0=4K 1=16K 2=64K .. 6=16M */
-  bool kern = ((uint32_t)entry_hi >= 0x80000000u) || ((entry_hi >> 62) == 3);
-  g_tlbpm[kern ? 1 : 0][sz]++;
-}
-void tlbpm_report() {
-  if(!g_tlbpm_on) {
-    return;
+std::ostream &operator<<(std::ostream &out, const state_t &s) {
+  static const char *names[32] = {
+    "g0","g1","g2","g3","g4","g5","g6","g7",
+    "o0","o1","o2","o3","o4","o5","sp","o7",
+    "l0","l1","l2","l3","l4","l5","l6","l7",
+    "i0","i1","i2","i3","i4","i5","fp","i7"
+  };
+  out << std::hex << "pc " << s.pc << " npc " << s.npc
+      << " psr " << s.get_psr() << " wim " << s.wim
+      << " tbr " << s.tbr << " y " << s.y << "\n";
+  for(int i = 0; i < 32; i++) {
+    out << names[i] << " " << std::setw(8) << std::setfill('0')
+	<< s.r[widx(s.cwp, i)] << ((i & 7) == 7 ? "\n" : " ");
   }
-  static const char *nm[7] = {"4K", "16K", "64K", "256K", "1M", "4M", "16M"};
-  for(int k = 0; k < 2; k++) {
-    fprintf(stderr, "[tlbpm] %s:", k ? "kernel" : "user");
-    for(int i = 0; i < 7; i++) {
-      fprintf(stderr, " %s=%llu", nm[i], (unsigned long long)g_tlbpm[k][i]);
-    }
-    fprintf(stderr, "\n");
+  out << std::dec << std::setfill(' ');
+  return out;
+}
+
+/* ---------------------------------------------------------------- memory */
+
+static inline uint8_t  be(uint8_t x)  { return x; }
+static inline uint16_t be(uint16_t x) { return __builtin_bswap16(x); }
+static inline uint32_t be(uint32_t x) { return __builtin_bswap32(x); }
+
+/* Physical space is 36 bits.  RAM is sparse_mem below ram_size (sun4m RAM sits
+ * at PA 0); everything else, including PA >= 4GB, is sun4m device space. */
+template <typename T>
+static T ld_phys(state_t *s, uint64_t pa) {
+  if(pa < s->ram_size) {
+    return be(s->mem.get<T>(pa));
   }
-}
-
-static inline bool valid_page_mask(uint32_t pm) {
-  switch(pm)
-    {
-    case 0x0000000: case 0x0006000: case 0x001e000: case 0x007e000:
-    case 0x01fe000: case 0x07fe000: case 0x1ffe000:
-      return true;
-    default:
-      return false;
-    }
-}
-
-/* r9999-virt harness: stop the run when the console prints "fpga_done" (the
- * initramfs /init's completion marker), as interp_rv64 does. */
-static void console_watch(state_t *s, char c) {
-  static const char marker[] = "fpga_done";
-  static unsigned matched = 0;
-  matched = (c == marker[matched]) ? (matched + 1) : ((c == marker[0]) ? 1 : 0);
-  if(matched == sizeof(marker) - 1) {
-    s->brk = 1;
-    matched = 0;
+  if(s->dev) {
+    return static_cast<T>(s->dev->read(s, pa, sizeof(T), &s->bus_error));
   }
-}
-
-static uint64_t g_fpe_traps = 0;   /* FP exceptions taken (cause 15), shown with PCSAMPLE */
-
-void maybe_take_interrupt(state_t *s) {
-  maybe_take_interrupt_inline(s);
-}
-
-/* the device poll + Int delivery half of maybe_take_interrupt, every INT_POLL
- * instructions or right after a device raised one (irq_poke) */
-void device_poll_and_deliver(state_t *s) {
-  s->irq_poke = false;
-
-  /* IOC2/INT2 local0 (WD33C93 SCSI etc.) -> CP0 Cause IP[2] (bit 10). Level-
-   * sensitive: set while an unmasked local0 source is asserted, else clear. */
-  if(s->hpc) s->hpc->enet_poll();   /* drain the tap into the Seeq + deliver RX via DMA */
-  if(s->hpc && s->hpc->ioc2_ip2_pending()) s->cpr0[CPR0_CAUSE] |=  (1u << 10);
-  else                                     s->cpr0[CPR0_CAUSE] &= ~(1u << 10);
-  /* IOC2/INT3 local1 (Newport vertical retrace) -> CP0 Cause IP[3] (bit 11).  Only
-   * with the Newport board: without it nothing drives local1 and IP3 stays as before */
-  if(s->np) {
-    if(s->hpc && s->hpc->ioc2_ip3_pending()) {
-      s->cpr0[CPR0_CAUSE] |= (1u << 11);
-    }
-    else {
-      s->cpr0[CPR0_CAUSE] &= ~(1u << 11);
-    }
+  if(s->sun4m) {
+    return static_cast<T>(s->sun4m->read(s, pa, sizeof(T), &s->bus_error));
   }
-  uint32_t sr = s->cpr0[CPR0_SR], cause = s->cpr0[CPR0_CAUSE];
-  if((sr & SR_IE) && !(sr & (SR_EXL | SR_ERL)) && (((cause & sr) & 0xff00u) != 0u)) {
-    set_exc_pc(s);
-    raise_common(s, 0u);                               /* ExcCode 0 = Int */
-  }
-}
-
-static void raise_adel(state_t *s) {
-  set_exc_pc(s);
-  raise_common(s, 4u);
-}
-
-static void raise_ades(state_t *s) {
-  set_exc_pc(s);
-  raise_common(s, 5u);
-}
-
-/* Data Bus Error (ExcCode 7).  The IP22 MC answers a load to an address that no
- * GIO/HPC slave claims with a bus-error response; the exception is precise at the
- * load (EPC/Cause.BD as usual) and BadVAddr is NOT written (R4000 -- raise_common
- * leaves it alone).  Reuses s->tlb_fault as the generic "exception taken, abort
- * this instruction" flag so every load's existing `if(s->tlb_fault) return;` guard
- * drops the destination write.  Linux's get_dbe()-based GIO probe depends on this
- * to discover Newport; see ip22_gio_bus_error(). */
-static void raise_dbe(state_t *s) {
-  set_exc_pc(s);
-  raise_common(s, 7u);
-  s->tlb_fault = true;
-}
-
-/* Reserved Instruction exception setup (ExcCode=10), no diagnostic message. */
-static void take_exception_ri(state_t *s) {
-  set_exc_pc(s);
-  raise_common(s, 10u);
-}
-
-/* Coprocessor Unusable (ExcCode 11, Cause.CE[29:28] = coprocessor number).  Raised
- * when a CP1/FP op executes with Status.CU1==0 -- IRIX lazy-FPU: o32 processes run
- * with CU1=0 and enable FP on the first-use trap.  Mirrors the RTL decode_mips.sv
- * gate and the henny cosim ISS.  (raise_common does not set CE, so this is a
- * dedicated helper.) */
-static void take_exception_cpu(state_t *s, uint32_t ce) {
-  set_exc_pc(s);
-  bool exl_was_set = (s->cpr0[CPR0_SR] & SR_EXL) != 0;
-  s->cpr0[CPR0_CAUSE] = (s->cpr0[CPR0_CAUSE] & ~(0x1fu << 2) & ~(0x3u << 28))
-                        | (11u << 2) | ((ce & 0x3u) << 28);
-  s->cpr0[CPR0_SR]    = (s->cpr0[CPR0_SR] & ~SR_ERL) | SR_EXL;
-  xctx_update(s);
-  s->ll_armed = false;
-  s->pc = sext32(exc_vector(s, /*is_refill=*/false, exl_was_set, /*xtlb=*/false));
-}
-
-/* FP exception (ExcCode 15) with the Unimplemented-Op (E) bit set in FCSR.Cause
- * (bit 17) -- the catch-all for COP1 ops not done in HW: div/sqrt (always) and
- * add/sub/mul on a denormal operand/underflow, matching the RTL fpu.sv.  The OS
- * soft-float emulator decodes insn@EPC and emulates it. */
-static void take_exception_fpe(state_t *s) {
-  g_fpe_traps++;
-  set_exc_pc(s);
-  bool exl_was_set = (s->cpr0[CPR0_SR] & SR_EXL) != 0;
-  s->cpr0[CPR0_CAUSE] = (s->cpr0[CPR0_CAUSE] & ~(0x1fu << 2)) | (15u << 2);
-  s->cpr0[CPR0_SR]    = (s->cpr0[CPR0_SR] & ~SR_ERL) | SR_EXL;
-  xctx_update(s);
-  s->fcr1[CP1_CR31]  |= (1u << 17);
-  s->ll_armed = false;
-  s->pc = sext32(exc_vector(s, /*is_refill=*/false, exl_was_set, /*xtlb=*/false));
-}
-
-static void raise_ri(state_t *s, uint32_t inst) {
-  fprintf(stderr, "unimplemented: opcode=0x%02x funct=0x%02x @ pc=0x%08x\n",
-          inst >> 26, inst & 0x3fu, (uint32_t)s->pc);
-  take_exception_ri(s);
-}
-
-/* Execute a branch/jump delay-slot instruction.  Returns true iff the delay slot
- * raised an exception (Status.EXL went 0->1, i.e. it vectored).  In that case the
- * branch/jump must NOT be taken: the exception has already redirected pc to the
- * handler with EPC = the branch pc (BD=1), and overwriting pc with the branch
- * target would SWALLOW the delay-slot fault (the RTL takes it -> co-sim diverges). */
-template <bool EL>
-static inline bool run_delay_slot(state_t *s) {
-  bool exl_before = (s->cpr0[CPR0_SR] & SR_EXL) != 0;
-  bool saved = s->in_delay_slot;
-  s->in_delay_slot = true;
-  if(globals::exec_dbg) {
-    execMips<EL, true>(s);
-  }
-  else {
-    execMips<EL, false>(s);
-  }
-  s->in_delay_slot = saved;
-  return (!exl_before) && ((s->cpr0[CPR0_SR] & SR_EXL) != 0);
-}
-
-/* 64-bit operating mode, matching exec.sv:2640-2646:
- *   kernel=(KSU==0)|EXL|ERL ; user=(KSU==2)&!EXL&!ERL ; super=(KSU==1)&!EXL&!ERL
- *   in_64b = (kernel&KX) | (user&UX) | (super&SX). */
-static inline bool in_64b_mode(state_t *s) {
-  uint32_t sr = s->cpr0[CPR0_SR];
-  uint32_t ksu = (sr >> 3) & 3u;
-  bool exl = (sr & SR_EXL) != 0, erl = (sr & SR_ERL) != 0;
-  bool kernel = (ksu == 0u) || exl || erl;
-  bool user   = (ksu == 2u) && !exl && !erl;
-  bool super  = (ksu == 1u) && !exl && !erl;
-  /* 64-bit operations are always valid in Kernel mode (KX gates 64-bit
-   * addressing / the XTLB vector, not op availability); Supervisor/User need
-   * SX/UX.  Must match decode_mips.sv's w_in_64b_mode for the co-sim. */
-  return  kernel ||
-         (user   && (sr & SR_UX)) ||
-         (super  && (sr & SR_SX));
-}
-
-/* The 64-bit instructions decode_mips.sv gates behind 64-bit mode -- must match
- * EXACTLY so the co-sim agrees (RTL does NOT gate dsll32/dsrl32/dsra32, daddi,
- * or 64-bit loads/stores, so neither do we). */
-static inline bool is_64b_gated(uint32_t inst) {
-  uint32_t op = inst >> 26;
-  if(op == 0x19) return true;                  /* daddiu */
-  if(op != 0) return false;
-  switch(inst & 0x3fu) {
-    case 0x14: case 0x16: case 0x17:            /* dsllv dsrlv dsrav        */
-    case 0x1c: case 0x1d: case 0x1e: case 0x1f: /* dmult dmultu ddiv ddivu  */
-    case 0x2c: case 0x2d: case 0x2e: case 0x2f: /* dadd daddu dsub dsubu    */
-    case 0x38: case 0x3a: case 0x3b:            /* dsll dsrl dsra           */
-      return true;
-    default: return false;
-  }
-}
-
-static void raise_overflow(state_t *s) {
-  set_exc_pc(s);
-  raise_common(s, 12u);
-}
-
-static void raise_trap(state_t *s) {
-  set_exc_pc(s);
-  raise_common(s, 13u);
-}
-
-/* SYSCALL (ExcCode 8) / BREAK (ExcCode 9): trap into the kernel's general
- * exception handler (0x80000180). EPC = the syscall/break pc (the kernel's
- * handler advances past it before eret); set_exc_pc handles the delay-slot
- * case. (interp_mips was originally a user-mode sim that halted here; in
- * full-system OS mode these must vector to the kernel.) */
-static bool tlb_probe_ro(state_t *s, uint64_t va, uint32_t *pa);
-/* read a 32-bit big-endian word from a guest VA, non-faulting (returns false if
- * the VA is unmapped). Used to walk IRIX's curproc pointer chain. */
-bool guest_rd32_be(state_t *s, uint64_t va, uint32_t *out) {
-  uint32_t pa;
-  if(!tlb_probe_ro(s, va, &pa)) return false;
-  *out = __builtin_bswap32(s->mem.get<uint32_t>(pa));   /* guest is big-endian */
-  return true;
-}
-/* non-faulting byte-wise guest memory access for the gdb stub. Translates each
- * byte's VA (handles page crossings) and touches raw guest bytes -- the guest
- * is big-endian, so the bytes are already in target order for gdb. */
-bool gdb_mem_read(state_t *s, uint64_t va, uint8_t *buf, uint32_t len) {
-  for(uint32_t i = 0; i < len; i++) {
-    uint32_t pa;
-    if(!tlb_probe_ro(s, va + i, &pa)) return false;
-    buf[i] = *s->mem.peek_raw_ptr(pa);
-  }
-  return true;
-}
-bool gdb_mem_write(state_t *s, uint64_t va, const uint8_t *buf, uint32_t len) {
-  for(uint32_t i = 0; i < len; i++) {
-    uint32_t pa;
-    if(!tlb_probe_ro(s, va + i, &pa)) return false;
-    *s->mem.get_raw_ptr(pa) = buf[i];
-  }
-  return true;
-}
-/* One-shot dump of the IRIX "current process" -- comm name + pid + the pc/mode
- * it is executing. Wired to SIGUSR1 in main() so the live emulator can be asked
- * "what is IRIX running right now?" from another shell (kill -USR1 <pid>). */
-void dump_current_process(state_t *s) {
-#ifdef ENABLE_O32_TRACE
-  /* interrupted PC (EPC) + RA + a scan of the kernel stack for return addresses.
-   * When SIGUSR1 lands inside an interrupt handler, EPC is the PC that was
-   * preempted (the wait loop); the stack scan gives a rough backtrace. Works even
-   * in early init where there is no current uthread. */
-  {
-    uint32_t epc = (uint32_t)s->cpr0[CPR0_EPC];
-    uint32_t ra  = (uint32_t)s->gpr[31];
-    uint32_t sp  = (uint32_t)s->gpr[29];
-    uint32_t s0 = (uint32_t)s->gpr[16];    /* lcl_intrd's interrupt descriptor ptr */
-    uint32_t hdlr = 0, lvl = 0, mbit = 0;
-    guest_rd32_be(s, (uint64_t)(int64_t)(int32_t)(s0 +  0), &hdlr);  /* handler fn */
-    guest_rd32_be(s, (uint64_t)(int64_t)(int32_t)(s0 +  8), &mbit);  /* mask bit */
-    guest_rd32_be(s, (uint64_t)(int64_t)(int32_t)(s0 + 12), &lvl);   /* local level 0/1/2 */
-    fprintf(stderr, "[spin] icnt=%lu pc=%08x epc=%08x ra=%08x s0=%08x hdlr=%08x lvl=%u mbit=%08x sp=%08x stack:",
-            (unsigned long)s->icnt, (uint32_t)s->pc, epc, ra, s0, hdlr, lvl, mbit, sp);
-    for(int i = 0; i < 96; i++) {
-      uint32_t w;
-      if(!guest_rd32_be(s, (uint64_t)(int64_t)(int32_t)(sp + i * 4), &w)) break;
-      if(w >= 0x88002180u && w < 0x882aa180u) fprintf(stderr, " %08x", w);
-    }
-    fprintf(stderr, "\n");
-  }
-#endif
-  uint32_t ut, proc;
-  if(!guest_rd32_be(s, 0xFFFFFFFFFFFFA014ULL, &ut) || ut == 0) {
-    fprintf(stderr, "[curproc] icnt=%lu pc=%08x: no current uthread\n",
-            (unsigned long)s->icnt, (uint32_t)s->pc);
-    return;
-  }
-  if(!guest_rd32_be(s, (uint64_t)(int64_t)(int32_t)ut + 488, &proc) || proc == 0) {
-    fprintf(stderr, "[curproc] icnt=%lu pc=%08x: ut=%08x has no proc\n",
-            (unsigned long)s->icnt, (uint32_t)s->pc, ut);
-    return;
-  }
-  uint64_t pbase = (uint64_t)(int64_t)(int32_t)proc;
-  char comm[33]; int ci = 0;
-  for(; ci < 32; ci++) {
-    uint32_t pa;
-    if(!tlb_probe_ro(s, pbase + 1512 + ci, &pa)) break;
-    uint8_t c = s->mem.get<uint8_t>(pa);
-    if(c == 0) break;
-    comm[ci] = (c >= 32 && c < 127) ? (char)c : '.';
-  }
-  comm[ci] = 0;
-  uint32_t pid = 0; guest_rd32_be(s, pbase + 420, &pid);   /* p_pid (prgetpsinfo: proc+420) */
-  bool user = (uint32_t)s->pc < 0x80000000u;
-  fprintf(stderr, "[curproc] icnt=%lu pc=%08x (%s) proc=%08x pid=%u comm='%s'\n",
-          (unsigned long)s->icnt, (uint32_t)s->pc, user ? "user" : "kernel",
-          proc, pid, comm);
-}
-static void raise_syscall(state_t *s) {
-  set_exc_pc(s);
-  raise_common(s, 8u);
-}
-static void raise_break(state_t *s) {
-  set_exc_pc(s);
-  raise_common(s, 9u);
-}
-
-void raise_int(state_t *s, uint32_t epc) {
-  s->cpr0[CPR0_EPC]   = epc;
-  s->cpr0[CPR0_CAUSE] = (1u << 15);  /* IP[7]=1 (timer), ExcCode=0, BD=0 */
-  s->cpr0[CPR0_SR]    = (s->cpr0[CPR0_SR] & ~SR_ERL) | SR_EXL;
-  xctx_update(s);
-  s->pc = sext32(0xBFC00180u);
-}
-
-/* The FP condition code lives ARCHITECTURALLY IN FCSR: FCC0 at bit 23, FCC1..7
- * at bits 25..31 (R4400/MIPS III has only FCC0).  R4400 manual, Control/Status
- * Register Condition Bit: "the result is stored at bit 23, the Condition bit, to
- * save or restore the state of the condition line ... Bit 23 is affected only by
- * compare and Move Control To FPU instructions" -- Move Control To FPU is CTC1.
- * FCCR (FCR25) is an ALTERNATE VIEW of the same bits, not a second copy.
- *
- * This used to keep the condition code only in FCR25 while CTC1/CFC1 touched
- * only FCR31, so `ctc1 $t,$31` (exactly what an FP context restore does) never
- * reached the bit BC1T/BC1F read, and a compare never reached the bit CFC1
- * returns.  The r9999 RTL has the SAME split, which is why the co-sim never
- * caught it -- see tests/fpu/fp_fcc.S. */
-static inline uint32_t fcc_bit(uint32_t cc) {
-  return (cc == 0) ? 23u : (24u + cc);
-}
-
-static uint32_t getConditionCode(state_t *s, uint32_t cc) {
-  return (s->fcr1[CP1_CR31] >> fcc_bit(cc)) & 0x1u;
-}
-
-/* keep the FCR25 view in step with the FCSR bits */
-static inline void fcc_mirror_to_fccr(state_t *s) {
-  uint32_t f = s->fcr1[CP1_CR31];
-  uint32_t v = (f >> 23) & 0x1u;
-  for(uint32_t c = 1; c < 8; c++) {
-    v |= ((f >> (24u + c)) & 0x1u) << c;
-  }
-  s->fcr1[CP1_CR25] = v;
-}
-
-/* and the reverse, for a write to FCR25 */
-static inline void fcc_mirror_from_fccr(state_t *s) {
-  uint32_t v = s->fcr1[CP1_CR25];
-  uint32_t f = s->fcr1[CP1_CR31] & ~((1u<<23) | 0xfe000000u);
-  f |= (v & 1u) << 23;
-  for(uint32_t c = 1; c < 8; c++) {
-    f |= ((v >> c) & 1u) << (24u + c);
-  }
-  s->fcr1[CP1_CR31] = f;
-}
-
-static void setConditionCode(state_t *s, uint32_t v, uint32_t cc) {
-  uint32_t b = fcc_bit(cc);
-  if(v) {
-    s->fcr1[CP1_CR31] |= (1u << b);
-  }
-  else {
-    s->fcr1[CP1_CR31] &= ~(1u << b);
-  }
-  fcc_mirror_to_fccr(s);
-}
-
-
-
-/* ------------------------------------------------------------------------
- * Translating TLB (R4000), matching the r9999 RTL tlb.sv semantics.
- *
- * EntryHi  : R[63:62] | VPN2[39:13] | ASID[7:0]
- * EntryLo0/1: PFN[33:6] | C[5:3] | D[2] | V[1] | G[0]
- * PageMask : mask bits [24:13] (4KB..16MB pages; for 4KB pages PageMask=0)
- * Context  : PTEBase[63:23] | BadVPN2[22:4] | 0[3:0]   (BadVPN2 = VA[31:13])
- * XContext : PTEBase[63:33]|R[32:31]|BadVPN2[30:4]|0    (BadVPN2 = VA[39:13])
- * ------------------------------------------------------------------------ */
-enum class tlb_op { fetch, load, store };
-
-/* Fold the faulting VA into Context (VA[31:13]<<4) and XContext (R, VA[39:13]<<4),
- * preserving the software-written PTEBase fields. Also set BadVAddr and
- * EntryHi.VPN2 (ASID preserved) so the refill handler can build the new entry. */
-/* R4400 CP0 write masks -- "Reserved. Must be written as zeroes, and returns zeroes
- * when read" (R4400 User's Manual Ed2, Fig 4-9/4-10/4-11 field tables):
- *   EntryHi    R[63:62] | VPN2[39:13] | ASID[7:0].  Fill[61:40] is "0 on read;
- *              ignored on write"; [12:8] reserved-zero.  27-bit VPN2 => 40-bit VA.
- *   PageMask   MASK[24:13] only; [31:25] and [12:0] reserved-zero.
- *   EntryLo0/1 PFN[29:6] | C[5:3] | D[2] | V[1] | G[0]; [63:30] reserved-zero.
- *              24-bit PFN => 36-bit PA (matches r9999 PA_WIDTH=36/PFN_WIDTH=24).
- * Without these a spec-probing guest measures the wrong implemented widths: Linux
- * cpu_probe_vmbits writes all-ones to EntryHi and takes fls64 of the readback, which
- * reported 62 VA bits instead of 40 until the EntryHi mask was added.  Found by the
- * FPGA-vs-interp boot-trace diff. */
-static inline uint64_t cp0_write_mask(uint32_t rd, uint64_t v) {
-  switch(rd)
-    {
-    case CPR0_ENTRYHI:
-      return (v & 0xc000000000000000ULL)    /* R    */
-           | (v & 0x000000ffffffe000ULL)    /* VPN2 */
-           | (v & 0x00000000000000ffULL);   /* ASID */
-    case CPR0_PAGEMASK:
-      return v & 0x0000000001ffe000ULL;     /* MASK[24:13] */
-    case CPR0_ENTRYLO0:
-    case CPR0_ENTRYLO1:
-      return v & 0x000000003fffffffULL;     /* PFN|C|D|V|G = [29:0] */
-    default:
-      return v;
-    }
-}
-
-static void tlb_set_fault_state(state_t *s, uint64_t va) {
-  s->cpr0[CPR0_BADVADDR]     = (uint32_t)va;
-  s->cpr0_64[CPR0_BADVADDR]  = va;
-
-  /* EntryHi: VPN2 = VA[39:13], R = VA[63:62]; preserve ASID[7:0] */
-  uint64_t r    = (va >> 62) & 0x3;
-  uint64_t vpn2 = (va >> 13) & 0x7ffffffULL;          /* [39:13] -> 27 bits */
-  uint64_t asid = s->cpr0_64[CPR0_ENTRYHI] & 0xffULL;
-  uint64_t ehi  = (r << 62) | (vpn2 << 13) | asid;
-  s->cpr0_64[CPR0_ENTRYHI] = ehi;
-  s->cpr0[CPR0_ENTRYHI]    = (uint32_t)ehi;
-  xctx_update(s);
-
-  /* Context: [22:4] = VA[31:13]; preserve PTEBase [63:23] */
-  uint64_t ctx = s->cpr0_64[CPR0_CONTEXT] & ~0x7fffffULL;
-  ctx |= ((va >> 13) & 0x7ffffULL) << 4;              /* VA[31:13] -> [22:4] */
-  s->cpr0_64[CPR0_CONTEXT] = ctx;
-  s->cpr0[CPR0_CONTEXT]    = (uint32_t)ctx;
-
-  /* XContext: [3:0]=0, [30:4]=VA[39:13] (BadVPN2), [32:31]=R; preserve PTEBase. */
-  uint64_t xctx = s->cpr0_64[CPR0_XCONTEXT] & ~0x1ffffffffULL;
-  xctx |= ((va >> 13) & 0x7ffffffULL) << 4;           /* BadVPN2 -> [30:4] */
-  xctx |= r << 31;                                    /* R -> [32:31] */
-  s->cpr0_64[CPR0_XCONTEXT] = xctx;
-  s->cpr0[CPR0_XCONTEXT]    = (uint32_t)xctx;
-}
-
-/* Raise a TLB exception: Refill (no match), Invalid (V=0), or Modified.
- * is_refill picks the dedicated refill/XTLB vector when EXL==0. */
-/* TRACEWIN_SEGV: freeze the retire-trace ring the instant an o32 (user) process
- * faults to a wild address (near-null or a kernel address = the classic bad-pointer
- * SEGV), so the ring holds the o32 run-up and not the post-crash delayloop. */
-static bool g_ring_frozen = false;
-
-static void raise_tlb(state_t *s, uint64_t va, uint32_t exccode,
-                      bool is_refill, bool is_xtlb) {
-  static const bool tlbdbg = getenv("TLBDBG") != nullptr;
-#ifdef ENABLE_O32_TRACE
-  { static const bool seg_trig = getenv("TRACEWIN_SEGV") != nullptr;
-    static uint64_t seg_floor = getenv("TRACEWIN_SEGV_FLOOR") ? strtoull(getenv("TRACEWIN_SEGV_FLOOR"),0,0) : 0;
-    /* A user process faulting to a KERNEL address (>=0x80000000, always an AdE bug)
-     * or the null page (<0x1000) = the classic bad-pointer SEGV. Floor skips early boot.
-     * Gate on USER mode (KSU==2 & !EXL & !ERL) -- raise_tlb runs before EXL is set, so
-     * Status still reflects the faulting context. This catches the o32 process's OWN
-     * fault (pmie) and excludes the downstream kernel derail (pc=0/ra=0, kernel mode). */
-    uint32_t seg_sr = s->cpr0[CPR0_SR];
-    bool seg_umode = (((seg_sr >> 3) & 3u) == 2u) && !(seg_sr & SR_EXL) && !(seg_sr & SR_ERL);
-    if(seg_trig && !g_ring_frozen && seg_umode && (uint32_t)s->pc < 0x80000000u
-       && s->icnt >= seg_floor && ((uint32_t)va < 0x00001000u || (uint32_t)va >= 0x80000000u)) {
-      g_ring_frozen = true;
-      uint32_t inst = 0; guest_rd32_be(s, s->pc, &inst);
-      uint32_t base = (inst >> 21) & 0x1f, rt = (inst >> 16) & 0x1f;
-      fprintf(stderr, "[segv-trig] FROZE ring: user pc=%08x badaddr=%08x code=%u icnt=%lu inst=%08x op=%u base=r%u(=%08x) rt=r%u\n",
-              (uint32_t)s->pc, (uint32_t)va, exccode, (unsigned long)s->icnt, inst,
-              inst >> 26, base, (uint32_t)s->gpr[base], rt);
-      fprintf(stderr, "[segv-trig] gpr:");
-      for(int i = 0; i < 32; i++) fprintf(stderr, " r%d=%08x", i, (uint32_t)s->gpr[i]);
-      fprintf(stderr, "\n");
-      /* t9-null-call case (pc==0 = jalr t9 with t9==0): dump the caller's code around
-       * ra, and find the `lw t9, off(gp)` (PIC GOT load) -> read the GOT word it loaded.
-       * GOTWORD==0 => rld didn't relocate (dynamic-linking bug); GOTWORD!=0 but t9==0
-       * => interp mis-loaded the GOT word (32b load bug). */
-      if((uint32_t)s->pc == 0) {
-        uint32_t ra = (uint32_t)s->gpr[31], gp = (uint32_t)s->gpr[28];
-        fprintf(stderr, "[segv-trig] caller code (ra-64..ra):\n");
-        for(int k = 16; k >= 0; k--) {
-          uint32_t ci = 0; guest_rd32_be(s, ra - k*4, &ci);
-          fprintf(stderr, "   %08x: %08x%s\n", ra - k*4, ci,
-                  ((ci >> 26) == 0x23 && ((ci >> 16) & 0x1f) == 25) ? "   <- lw t9" :
-                  ((ci & 0xfc1fffff) == 0x0320f809) ? "   <- jalr t9" : "");
-        }
-        for(int k = 2; k <= 64; k++) {   /* search back for lw t9, off(gp) */
-          uint32_t ci = 0; guest_rd32_be(s, ra - k*4, &ci);
-          if((ci >> 26) == 0x23 && ((ci >> 16) & 0x1f) == 25 && ((ci >> 21) & 0x1f) == 28) {
-            int32_t off = (int16_t)(ci & 0xffff);
-            uint32_t gotaddr = gp + off, gotword = 0; guest_rd32_be(s, gotaddr, &gotword);
-            fprintf(stderr, "[GOT] lw t9 @%08x off=%d gp=%08x -> gotaddr=%08x GOTWORD=%08x\n",
-                    ra - k*4, off, gp, gotaddr, gotword);
-            break;
-          }
-        }
-      }
-      else {
-        /* data-null-deref case: dump code around the faulting pc so the sequence
-         * that computed the null base register (r%base) is visible. */
-        fprintf(stderr, "[segv-trig] faulting code (pc-32..pc+4), null base=r%u:\n", base);
-        for(int k = 8; k >= -1; k--) {
-          uint32_t ci = 0; guest_rd32_be(s, (uint32_t)s->pc - k*4, &ci);
-          fprintf(stderr, "   %08x: %08x%s\n", (uint32_t)s->pc - k*4, ci,
-                  (k == 0) ? "   <- FAULT" : "");
-        }
-      }
-      /* WRTRACK unified: follow the nullptr backwards regardless of manifestation.
-       * Identify the null pointer register -- data-deref: the faulting load's base;
-       * pc==0: `jr ra` (r31==0) or `jalr t9` (r25==0) -- then use per-GPR load
-       * provenance to find the memory word it was loaded from, and the LAST STORE
-       * to that word. NEVER WRITTEN (pc/icnt 0) => the null is the zero-fill: a
-       * MISSING init/relocation. A surprising writer PC => that store is the
-       * corruptor. */
-      if(g_wrtrack) {
-        int nr = -1;
-        if((uint32_t)s->pc == 0) {
-          nr = (s->gpr[31] == 0) ? 31 : (s->gpr[25] == 0 ? 25 : -1);
-        }
-        else {
-          nr = (int)base;
-        }
-        if(nr >= 0 && g_gpr_ld_pc[nr] != 0) {
-          uint32_t pa = g_gpr_ld_pa[nr]; uint64_t w = (uint64_t)pa >> 2;
-          fprintf(stderr, "[WRTRACK] null r%d last LOADED from VA %08x (PA %08x) by pc %08x\n",
-                  nr, g_gpr_ld_va[nr], pa, g_gpr_ld_pc[nr]);
-          fprintf(stderr, "[WRTRACK]   last STORE to that word: pc=%08x icnt=%lu%s\n",
-                  g_wr_pc[w], (unsigned long)g_wr_icnt[w],
-                  (g_wr_pc[w] == 0 && g_wr_icnt[w] == 0) ? "  (NEVER WRITTEN -> zero-fill; missing init/reloc)" : "");
-        }
-        else if(nr >= 0) {
-          fprintf(stderr, "[WRTRACK] null r%d has no load-provenance (set by ALU/jal, not a load)\n", nr);
-        }
-      }
-    } }
-#endif
-  bool exl_was_set = (s->cpr0[CPR0_SR] & SR_EXL) != 0;
-  tlb_set_fault_state(s, va);
-  { /* FAULTLOG: per-fault (cause,badaddr,pc) so re-fault counts can be compared vs the RTL. */
-    static const bool fl = getenv("FAULTLOG") != nullptr;
-    if(fl) fprintf(stderr, "[fault] cause=%u badaddr=%08x pc=%08x refill=%d icnt=%lu\n",
-                   exccode, (uint32_t)va, (uint32_t)s->pc, is_refill?1:0, (unsigned long)s->icnt);
-#ifdef ENABLE_O32_TRACE
-    /* FAULTLOG_USER: user-mode faults only (find the o32 SIGSEGV without the kernel refill flood).
-     * FAULTLOG_FLOOR skips early boot; true user-mode gate (KSU==2 & !EXL & !ERL) drops the
-     * kernel-refill / kernel-derail noise so only the o32 process's own faults show. */
-    static const bool flu = getenv("FAULTLOG_USER") != nullptr;
-    static const uint64_t flu_floor = getenv("FAULTLOG_FLOOR") ? strtoull(getenv("FAULTLOG_FLOOR"),0,0) : 0;
-    uint32_t flu_sr = s->cpr0[CPR0_SR];
-    bool flu_umode = (((flu_sr >> 3) & 3u) == 2u) && !(flu_sr & SR_EXL) && !(flu_sr & SR_ERL);
-    if(flu && flu_umode && s->icnt >= flu_floor)
-      fprintf(stderr, "[ufault] pc=%08x badaddr=%08x code=%u refill=%d EPC=%08x icnt=%lu\n",
-              (uint32_t)s->pc, (uint32_t)va, exccode, is_refill?1:0, s->cpr0[CPR0_EPC], (unsigned long)s->icnt);
-#endif
-    }
-  static const bool kptedbg = getenv("KPTEDBG") != nullptr;
-  if((uint32_t)va == 0xff800000u && kptedbg) {
-    static int once = 0;
-    if(once++ < 2) {
-      fprintf(stderr, "[KPTE] fault on 0xff800000: faultPC=%08x EPC=%08x exl=%d code=%u refill=%d ctx=%08x icnt=%lu\n",
-              (uint32_t)s->pc, s->cpr0[CPR0_EPC], exl_was_set?1:0, exccode, is_refill,
-              s->cpr0[CPR0_CONTEXT], (unsigned long)s->icnt);
-      for(int i = 0; i < state_t::NUM_TLB_ENTRIES; i++)
-        if(s->tlb[i].entry_hi || (s->tlb[i].entry_lo0 | s->tlb[i].entry_lo1) & 0x2)
-          fprintf(stderr, "   tlb[%2d] hi=%016llx lo0=%016llx lo1=%016llx pm=%08x\n", i,
-                  (unsigned long long)s->tlb[i].entry_hi,
-                  (unsigned long long)s->tlb[i].entry_lo0,
-                  (unsigned long long)s->tlb[i].entry_lo1, s->tlb[i].page_mask);
-    }
-  }
-  { static const bool g_f1cf = getenv("F1C_PROBE") != nullptr;
-    if(g_f1cf && ((uint32_t)va >> 12) == 0x200u)
-      fprintf(stderr, "[F1C-FAULT] va=%08x pc=%08x code=%u refill=%d icnt=%lu\n",
-              (uint32_t)va, (uint32_t)s->pc, exccode, is_refill, (unsigned long)s->icnt); }
-  if(tlbdbg)
-    fprintf(stderr, "[raise_tlb] va=%016llx code=%u refill=%d xtlb=%d pc=%08x exl=%d ctx=%08x ctx64=%016llx\n",
-            (unsigned long long)va, exccode, is_refill, is_xtlb, (uint32_t)s->pc,
-            exl_was_set ? 1 : 0, s->cpr0[CPR0_CONTEXT],
-            (unsigned long long)s->cpr0_64[CPR0_CONTEXT]);
-  set_exc_pc(s);
-  s->cpr0[CPR0_CAUSE] = (s->cpr0[CPR0_CAUSE] & ~(0x1fu << 2)) | (exccode << 2);
-  s->cpr0[CPR0_SR]    = (s->cpr0[CPR0_SR] & ~SR_ERL) | SR_EXL;
-  xctx_update(s);
-  s->pc = sext32(exc_vector(s, is_refill && !exl_was_set, exl_was_set, is_xtlb));
-  s->tlb_fault = true;
-}
-
-/* Translate a virtual address. On a TLB exception, sets s->tlb_fault and returns
- * 0 (the caller must check s->tlb_fault and abort the instruction). Otherwise
- * returns the physical address. Unmapped segments (kseg0/kseg1, xkphys) are a
- * fast path with no lookup. */
-/* Software micro-TLB: a direct-mapped cache of recent (VPN,ASID)->PPN mappings
- * in front of the 48-entry architectural TLB CAM, so the common case skips the
- * full linear scan on every fetch/load/store. The architectural s->tlb[] stays
- * the source of truth -- this is purely a sim accelerator (mirrors the
- * interp_rv64 lookup_tlb trick). Per-4KB-page keying makes it page-size
- * agnostic: ppn=pa>>12 reconstructs the right PA for any PageMask. Flushed on
- * any TLB write (TLBWI/TLBWR) -- the only ops that change a mapping -- so a hit
- * can never diverge from what the CAM would return. ASID is part of the tag, so
- * an ASID change needs no flush (stale entries simply miss and re-walk; global
- * pages get cached per-ASID). */
-static const int UTLB_SZ = 64;          /* power of two */
-struct utlb_entry { uint64_t vpn, asid; uint32_t ppn; bool dirty, valid, cached; };
-static utlb_entry g_utlb[UTLB_SZ];
-/* Fetch-page cache (interp_rv64's same-page trick): the last instruction-fetch page's
- * translation.  A hit needs the same VA page, ASID and Status, so exceptions/ERET/mtc0
- * Status/EntryHi changes miss by construction; only TLB writes must flush it. */
-static bool g_fc_valid = false;
-static uint64_t g_fc_vpage = 0;
-static uint32_t g_fc_ppage = 0;
-static inline void dfast_flush();
-/* translation context: ASID | the SR mode bits (EXL ERL KSU UX SX KX).  Kept in g_xctx by
- * xctx_update() at every SR / EntryHi write, so the fetch cache and the soft TLB check one
- * word instead of re-reading CP0 per access (the DBG instance verifies it every insn). */
-uint64_t g_xctx = 0;
-static inline uint64_t xctx_compute(const state_t *s) {
-  return (s->cpr0_64[CPR0_ENTRYHI] & 0xffULL) | ((uint64_t)(s->cpr0[CPR0_SR] & 0xfeu) << 8);
-}
-void xctx_update(state_t *s) {
-  g_xctx = xctx_compute(s);
-  g_fc_valid = false;
-}
-static inline void utlb_flush() { for(auto &e : g_utlb) e.valid = false; g_fc_valid = false; dfast_flush(); }
-
-/* TLBDUP (env-gated): after a TLBWI/TLBWR installs entry `idx`, scan for ANOTHER
- * slot that ALSO matches on VPN2[39:13]+R[63:62]+(ASID or both-Global), with both
- * pages considered valid iff V0|V1 -- i.e. the r9999 CAM would light up two match
- * lines.  IRIX is duplicate-safe by design (immu.h: probe-first tlbdropin + blind
- * tlbwr only on a genuine refill), so if the golden ISS NEVER fires this while the
- * RTL does, the duplicate is an r9999 artifact (a spurious refill on a resident
- * VA), confirming find_lowest_set_bit neutralizes rather than merely papers over.
- * Mirrors henry_tb.cpp's TLBDUP so the two are apples-to-apples. */
-static void iss_tlbdup_check(state_t *s, uint32_t idx, const char *how) {
-  static const bool en = getenv("TLBDUP") != nullptr;
-  if(!en) return;
-  uint64_t ehi = s->tlb[idx].entry_hi, lo0 = s->tlb[idx].entry_lo0, lo1 = s->tlb[idx].entry_lo1;
-  uint64_t vpn2 = (ehi >> 13) & 0x7ffffffULL, r = (ehi >> 62) & 0x3ULL, asid = ehi & 0xffULL;
-  bool gl = (lo0 & 1u) && (lo1 & 1u);
-  bool vld = ((lo0 >> 1) & 1u) || ((lo1 >> 1) & 1u);
-  if(!vld) return;                                   /* skip invalid placeholder writes */
-  for(int j = 0; j < state_t::NUM_TLB_ENTRIES; j++) {
-    if((uint32_t)j == idx) continue;
-    uint64_t jhi = s->tlb[j].entry_hi, jl0 = s->tlb[j].entry_lo0, jl1 = s->tlb[j].entry_lo1;
-    bool jvld = ((jl0 >> 1) & 1u) || ((jl1 >> 1) & 1u);
-    if(!jvld) continue;
-    bool jgl = (jl0 & 1u) && (jl1 & 1u);
-    bool va_match = (((jhi >> 13) & 0x7ffffffULL) == vpn2) && (((jhi >> 62) & 0x3ULL) == r);
-    bool ai_match = ((jhi & 0xffULL) == asid) || (gl && jgl);
-    if(va_match && ai_match)
-      fprintf(stderr, "[ISS-TLBDUP] %s vpn2=%llx r=%llu asid=%02llx : entry %u (lo0=%llx lo1=%llx) == entry %d (lo0=%llx lo1=%llx) icnt=%llu\n",
-        how, (unsigned long long)vpn2, (unsigned long long)r, (unsigned long long)asid,
-        idx, (unsigned long long)lo0, (unsigned long long)lo1,
-        j, (unsigned long long)jl0, (unsigned long long)jl1, (unsigned long long)s->icnt);
-  }
-}
-
-
-static const uint64_t g_uitlb_interval = getenv("UITLBSTATS") ? strtoull(getenv("UITLBSTATS"), nullptr, 0) : 0;
-struct uitlb_ent_t { uint64_t vpn2, pm, r, asid; bool g, valid; };
-struct uitlb_model_t {
-  int n;
-  uitlb_ent_t e[16];
-  uint8_t lfsr;
-  uint64_t hit, miss, miss_user;
-};
-static uitlb_model_t g_uitlb[4] = {{2, {}, 0x5a, 0, 0, 0}, {4, {}, 0x5a, 0, 0, 0},
-                                   {8, {}, 0x5a, 0, 0, 0}, {16, {}, 0x5a, 0, 0, 0}};
-static uint64_t g_uitlb_asid = ~0ULL, g_uitlb_next = 0, g_uitlb_fetch = 0, g_uitlb_fetch_user = 0;
-static void uitlb_model_flush() {
-  for(auto &m : g_uitlb) {
-    for(int i = 0; i < m.n; i++) {
-      m.e[i].valid = false;
-    }
-  }
-}
-static void uitlb_model_fetch(state_t *s, uint64_t va, uint64_t cur_asid) {
-  if(cur_asid != g_uitlb_asid) {
-    uitlb_model_flush();
-    g_uitlb_asid = cur_asid;
-  }
-  const bool user = (va >> 31) == 0;
-  g_uitlb_fetch++;
-  if(user) {
-    g_uitlb_fetch_user++;
-  }
-  const uint64_t vpn2 = (va >> 13) & 0x7ffffffULL, r = (va >> 62) & 3;
-  for(auto &m : g_uitlb) {
-    m.lfsr = (uint8_t)((m.lfsr << 1) | (((m.lfsr >> 7) ^ (m.lfsr >> 5) ^ (m.lfsr >> 4) ^ (m.lfsr >> 3)) & 1));
-    bool h = false;
-    for(int i = 0; i < m.n; i++) {
-      const uitlb_ent_t &u = m.e[i];
-      if(u.valid && (((u.vpn2 ^ vpn2) & ~u.pm & 0x7ffffffULL) == 0) && u.r == r && (u.asid == cur_asid || u.g)) {
-        h = true;
-        break;
-      }
-    }
-    if(h) {
-      m.hit++;
-      continue;
-    }
-    m.miss++;
-    if(user) {
-      m.miss_user++;
-    }
-    /* install from the 48-way (same Sail match as va_translate_inner) */
-    for(int i = 0; i < state_t::NUM_TLB_ENTRIES; i++) {
-      const uint64_t pm = s->tlb[i].page_mask & 0x1ffe000ULL;
-      const uint64_t vpnMask = (~(uint64_t)(pm | 0x1fffULL)) & 0x000000ffffffe000ULL;
-      const uint64_t e_hi = s->tlb[i].entry_hi;
-      const bool g = (s->tlb[i].entry_lo0 & 1u) && (s->tlb[i].entry_lo1 & 1u);
-      if(((va & vpnMask) == (e_hi & vpnMask)) && (((va >> 62) & 3) == ((e_hi >> 62) & 3)) &&
-         (g || cur_asid == (e_hi & 0xffULL))) {
-        uitlb_ent_t &u = m.e[m.lfsr % m.n];
-        u.vpn2 = (e_hi >> 13) & 0x7ffffffULL;
-        u.pm = pm >> 13;
-        u.r = (e_hi >> 62) & 3;
-        u.asid = e_hi & 0xffULL;
-        u.g = g;
-        u.valid = true;
-        break;
-      }
-    }
-  }
-  if(s->icnt >= g_uitlb_next) {
-    g_uitlb_next = s->icnt + g_uitlb_interval;
-    fprintf(stderr, "[uitlb] icnt %llu mapped_fetch %llu (user %llu)", (unsigned long long)s->icnt,
-            (unsigned long long)g_uitlb_fetch, (unsigned long long)g_uitlb_fetch_user);
-    for(const auto &m : g_uitlb) {
-      fprintf(stderr, " | NU%d miss %llu (user %llu) hit%% %.3f mpki %.3f", m.n,
-              (unsigned long long)m.miss, (unsigned long long)m.miss_user,
-              100.0 * m.hit / (double)(m.hit + m.miss), 1000.0 * m.miss / (double)s->icnt);
-    }
-    fprintf(stderr, "\n");
-  }
-}
-
-static uint32_t va_translate_inner(state_t *s, uint64_t va, tlb_op op) {
-  uint32_t hi32 = (uint32_t)(va >> 32);
-  uint32_t lo32 = (uint32_t)va;
-
-  /* WATCHC4: log every store/load to the /sbin/sh crash slot 0x0e0981c4 (node-1b8 +12 field
-   * that the RTL misreads as 0 vs golden 0x0e07bbc0) with pc+icnt, to find the build store's
-   * PC and the store->crash-load instruction distance. */
-  { static const bool g_watchc4 = getenv("WATCHC4") != nullptr;
-    // STORES to the whole node-1b8 region [0e0981b8,0e0981c8) (catches sd@c0, sw@c4, unaligned,
-    // or a block copy), plus the exact-c4 loads for the store->load distance.
-    if(g_watchc4 && op == tlb_op::store && lo32 >= 0x0e0981b8u && lo32 < 0x0e0981c8u)
-      fprintf(stderr, "[watchc4] STORE pc=%08x va=%08x icnt=%llu\n",
-        (uint32_t)s->pc, lo32, (unsigned long long)s->icnt);
-    if(g_watchc4 && op == tlb_op::load && lo32 == 0x0e0981c4u)
-      fprintf(stderr, "[watchc4] load  pc=%08x va=%08x icnt=%llu\n",
-        (uint32_t)s->pc, lo32, (unsigned long long)s->icnt); }
-
-  /* WATCHVA: env-configurable watch of a single VA (WATCHVA_ADDR).  On every store into the
-   * word [addr,addr+8) record (pc,icnt); on every load of addr print the store->load distance.
-   * Used to answer "which store wrote the value the crash-load reads, and how far back". */
-  { static const uint32_t g_wva = getenv("WATCHVA_ADDR") ? (uint32_t)strtoul(getenv("WATCHVA_ADDR"),0,0) : 0;
-    static uint32_t wva_spc = 0; static uint64_t wva_sicnt = 0;
-    if(g_wva) {
-      if(op == tlb_op::store && lo32 >= g_wva && lo32 < g_wva+8u) {
-        wva_spc = (uint32_t)s->pc; wva_sicnt = s->icnt;
-        fprintf(stderr, "[watchva] STORE pc=%08x va=%08x icnt=%llu\n",(uint32_t)s->pc, lo32, (unsigned long long)s->icnt);
-      }
-      if(op == tlb_op::load && lo32 >= g_wva && lo32 < g_wva+8u)
-        fprintf(stderr, "[watchva] LOAD  pc=%08x va=%08x icnt=%llu  <- last store pc=%08x icnt=%llu (dist=%llu insns)\n",
-          (uint32_t)s->pc, lo32, (unsigned long long)s->icnt, wva_spc, (unsigned long long)wva_sicnt,
-          (unsigned long long)(s->icnt - wva_sicnt));
-    } }
-
-  /* IDXWR: shadow last-writer-PC per word (keyed on VA), to find what STORES the
-   * array-insert index mem[s4] loaded at 0e774150.  On each store record the storing
-   * PC for the base word (+next word to cover sd); at the idx-load print the writer. */
-  { static const bool g_idxwr = getenv("IDXWR") != nullptr;
-    static std::unordered_map<uint32_t,uint32_t> lastwr;
-    if(g_idxwr) {
-      if(op == tlb_op::store) {
-        lastwr[lo32 & ~3u] = (uint32_t)s->pc;   /* exact word only (no +4 over-record) */
-      }
-      if(op == tlb_op::load && (uint32_t)s->pc == 0x0e774150u) {
-        auto it = lastwr.find(lo32 & ~3u);
-        fprintf(stderr, "[idxwr] idx-load va=%08x last_writer_pc=%08x icnt=%llu\n",
-          lo32, (it==lastwr.end()?0xffffffffu:it->second), (unsigned long long)s->icnt);
-      }
-      /* CAPWR: at the capacity load (lw t0,4(v0) @0e774154) lo32 = table+4 = the
-       * capacity field; report who last WROTE it -> golden's capacity-sizing site. */
-      if(op == tlb_op::load && (uint32_t)s->pc == 0x0e774154u) {
-        auto it = lastwr.find(lo32 & ~3u);
-        fprintf(stderr, "[capwr] cap-load va=%08x last_writer_pc=%08x icnt=%llu\n",
-          lo32, (it==lastwr.end()?0xffffffffu:it->second), (unsigned long long)s->icnt);
-      }
-    }
-  }
-
-  /* cache_model: default this access to uncached; the cached returns below set it.
-   * Never cache an instruction fetch (D-cache-only model for now). */
-#ifdef ENABLE_CACHE_MODEL
-  s->mem.cache_active = false;
-#endif
-
-  /* 32-bit compatibility segments (sign-extended VA: hi32 is 0x00000000 for
-   * useg or 0xffffffff for kseg0..kseg3). */
-  if(hi32 == 0x00000000u || hi32 == 0xffffffffu) {
-    uint32_t seg = lo32 >> 29;
-    /* kseg0 (0x80000000-0x9fffffff) and kseg1 (0xa0000000-0xbfffffff): unmapped */
-    if(seg == 0x4 || seg == 0x5) {
-#ifdef ENABLE_CACHE_MODEL
-      if(seg == 0x4 && op != tlb_op::fetch) { s->mem.cache_active = true; } /* kseg0 cached */
-#endif
-      return lo32 & 0x1fffffff;
-    }
-    /* useg/kuseg (seg 0-3), ksseg/kseg2 (seg 6), kseg3 (seg 7): TLB mapped */
-  } else {
-    /* 64-bit address space. xkphys (bits[63:62]==2) is unmapped direct PA. */
-    if(((va >> 62) & 0x3) == 0x2) {
-      return (uint32_t)(va & 0xffffffffffULL);   /* low 40 bits = PA */
-    }
-    /* xkuseg/xksseg/xkseg etc: TLB mapped (fall through) */
-  }
-
-  /* ---- TLB lookup over the 48 entries ---- */
-  /* xtlb only selects the refill exception vector (XTLB vs TLB), keyed on 64-bit
-   * addressing (VA upper bits not a sign-extended 32-bit value). */
-  bool xtlb = !(hi32 == 0x00000000u || hi32 == 0xffffffffu);
-  uint64_t cur_asid = s->cpr0_64[CPR0_ENTRYHI] & 0xffULL;
-
-  /* UITLBSTATS=<interval insns>: count-only model of the r9999 RTL micro-ITLB
-   * (itlb.sv: NU-entry fully-assoc, VPN2/PageMask/R/ASID|G match, LFSR-random
-   * install from the 48-way on a miss, flushed on tlbwi/tlbwr and ASID change)
-   * at NU = 2/4/8/16 side by side.  Counts per fetched instruction; the miss
-   * count does not depend on the RTL's lookup granularity. */
-  if(g_uitlb_interval && op == tlb_op::fetch) {
-    uitlb_model_fetch(s, va, cur_asid);
-  }
-
-  /* micro-TLB fast path: a hit gives the PA without scanning the CAM. A store to
-   * a cached-but-not-dirty page falls through to the CAM so it raises Modified. */
-  uint64_t vpn = va >> 12;
-  utlb_entry &ce = g_utlb[vpn & (UTLB_SZ - 1)];
-  if(ce.valid && ce.vpn == vpn && ce.asid == cur_asid &&
-     !(op == tlb_op::store && !ce.dirty)) {
-#ifdef ENABLE_CACHE_MODEL
-    if(ce.cached && op != tlb_op::fetch) { s->mem.cache_active = true; }
-#endif
-    return (ce.ppn << 12) | (uint32_t)(va & 0xfffULL);
-  }
-
-  /* Sail tlbEntryMatch / tlbSearch (mips_tlb.sail) -- UNCONDITIONAL full match:
-   *   r=VA[63:62], vpn2=VA[39:13];
-   *   valid & (r==entryR) & ((vpn2 & vpnMask)==(entryVPN & vpnMask)) & (asid|G).
-   * No narrow/wide and R is ALWAYS compared (the spec has no 32-bit shortcut). */
-  for(int i = 0; i < state_t::NUM_TLB_ENTRIES; i++) {
-    uint64_t pm     = s->tlb[i].page_mask & 0x1ffe000ULL; /* mask bits [24:13] */
-    uint64_t vpnMask= (~(uint64_t)(pm | 0x1fffULL)) & 0x000000ffffffe000ULL; /* VPN2[39:13] */
-    uint64_t e_hi   = s->tlb[i].entry_hi;
-    bool global     = (s->tlb[i].entry_lo0 & 1u) && (s->tlb[i].entry_lo1 & 1u);
-    bool vpn_match  = ((va & vpnMask) == (e_hi & vpnMask))
-                   && (((va >> 62) & 0x3) == ((e_hi >> 62) & 0x3));
-    bool asid_match = global || (cur_asid == (e_hi & 0xffULL));
-    if(!(vpn_match && asid_match))
-      continue;
-
-    /* A TLB entry maps an even/odd page PAIR. With PageMask, (pm|0x1fff) spans the
-     * whole pair (offset+select); one page's offset is the low half of that, and
-     * the even/odd select bit is the bit just above the single-page offset.
-     * 4KB: pair=0x1fff -> off=0xfff (12 bits), select=0x1000 (bit 12). */
-    uint64_t pair_mask = pm | 0x1fffULL;
-    uint64_t off_mask  = pair_mask >> 1;           /* in-(single)page offset bits */
-    uint64_t sel_bit   = (pair_mask + 1) >> 1;     /* even/odd selector bit */
-    bool odd           = (va & sel_bit) != 0;
-    uint64_t e_lo      = odd ? s->tlb[i].entry_lo1 : s->tlb[i].entry_lo0;
-
-    /* HEAP_PROBE: page size + even/odd + D-bit for /sbin/sh heap stores.  RTL hardcodes
-     * w_odd=va[12] (4KB); if pm!=0 here the RTL selects the wrong half's D -> spurious cause-1. */
-    { static const bool g_hp = getenv("HEAP_PROBE") != nullptr;
-      if(g_hp && op == tlb_op::store && va >= 0x0e0a0000ULL && va < 0x0e0b0000ULL)
-        fprintf(stderr, "[HEAPPROBE] va=%09llx pm=%llx sel_bit=%llx odd=%d D=%d V=%d e_lo0=%llx e_lo1=%llx icnt=%llu\n",
-          (unsigned long long)va, (unsigned long long)pm, (unsigned long long)sel_bit, (int)odd,
-          (int)((e_lo>>2)&1), (int)((e_lo>>1)&1),
-          (unsigned long long)s->tlb[i].entry_lo0, (unsigned long long)s->tlb[i].entry_lo1,
-          (unsigned long long)s->icnt); }
-
-    if(!(e_lo & 0x2u)) {                            /* V == 0 -> TLB Invalid */
-      uint32_t code = (op == tlb_op::store) ? 3u : 2u;
-      raise_tlb(s, va, code, /*is_refill=*/false, xtlb);
-      return 0;
-    }
-    if(op == tlb_op::store && !(e_lo & 0x4u)) {     /* D == 0 -> TLB Modified */
-      { static const bool g_ht = getenv("HTRACE") != nullptr;   /* trace the kernel TLB-Mod handler for /sbin/sh heap */
-        if(g_ht && va >= 0x0e0a0000ULL && va < 0x0e0b0000ULL) g_htrace = 320; }
-#ifdef ENABLE_O32_TRACE
-      uint32_t modpc = (uint32_t)s->pc;             /* faulting pc, before raise_tlb rewrites s->pc */
-      uint64_t modva = va;
-#endif
-      raise_tlb(s, va, 1u, /*is_refill=*/false, xtlb);
-#ifdef ENABLE_O32_TRACE
-      /* MODLOG: dump user (o32) TLB-Modified exceptions -- the full 64b store VA and
-       * the BadVAddr/Context/EntryHi the kernel tlbmod handler walks. A 32-bit
-       * sign-extend/truncate bug shows up as a bad VA or a bad Context here. */
-      { static const bool g_ml = getenv("MODLOG") != nullptr;
-        static uint64_t g_mlf = getenv("MODLOG_FLOOR") ? strtoull(getenv("MODLOG_FLOOR"),0,0) : 0;
-        static int g_nml = 0;
-        if(g_ml && modpc < 0x80000000u && s->icnt >= g_mlf && g_nml++ < 80)
-          fprintf(stderr, "[MOD] pc=%08x va=%016llx e_lo=%016llx badv=%016llx ctx=%016llx ehi=%016llx icnt=%lu\n",
-                  modpc, (unsigned long long)modva, (unsigned long long)e_lo,
-                  (unsigned long long)s->cpr0_64[CPR0_BADVADDR], (unsigned long long)s->cpr0_64[CPR0_CONTEXT],
-                  (unsigned long long)s->cpr0_64[CPR0_ENTRYHI], (unsigned long)s->icnt); }
-#endif
-      return 0;
-    }
-    uint64_t pfn = (e_lo >> 6) & 0xfffffffULL;      /* PFN[33:6] -> 28 bits */
-    uint64_t pa  = (pfn << 12) | (va & off_mask);
-#ifdef ENABLE_O32_TRACE
-    /* DEVMAP: a MAPPED user access must NOT translate into the device-MMIO window
-     * 0x1f000000-0x1fffffff (that's where the o32 pointers vanish). Dump the matched
-     * TLB entry so we can tell a corrupt-PFN entry (bug at TLB-write time) from a
-     * mis-selected/mis-extracted PA (bug here). */
-    { static const bool g_dm = getenv("DEVMAP") != nullptr;
-      if(g_dm && (uint32_t)pa >= 0x1f000000u && (uint32_t)pa <= 0x1fffffffu && (uint32_t)s->pc < 0x80000000u) {
-        static int g_ndm = 0;
-        if(g_ndm++ < 40)
-          fprintf(stderr, "[DEVMAP] pc=%08x va=%016llx -> PA %08x  tlb[%d] e_hi=%016llx e_lo0=%016llx e_lo1=%016llx pm=%08x odd=%d pfn=%llx icnt=%lu\n",
-                  (uint32_t)s->pc, (unsigned long long)va, (uint32_t)pa, i,
-                  (unsigned long long)s->tlb[i].entry_hi,
-                  (unsigned long long)s->tlb[i].entry_lo0, (unsigned long long)s->tlb[i].entry_lo1,
-                  s->tlb[i].page_mask, (int)odd, (unsigned long long)pfn, (unsigned long)s->icnt);
-      }
-    }
-#endif
-    bool cca_cached = (((e_lo >> 3) & 7u) == 3u);    /* C==3: cacheable write-back */
-    /* fill the micro-TLB for this 4KB sub-page (only reached for a V=1 hit) */
-    ce.vpn = vpn; ce.asid = cur_asid; ce.ppn = (uint32_t)(pa >> 12);
-    ce.dirty = (e_lo & 0x4u) != 0; ce.valid = true; ce.cached = cca_cached;
-#ifdef ENABLE_CACHE_MODEL
-    if(cca_cached && op != tlb_op::fetch) { s->mem.cache_active = true; }
-#endif
-    return (uint32_t)pa;
-  }
-
-  /* No match -> TLB Refill */
-  static const bool tlbdbg = getenv("TLBDBG") != nullptr;
-  if(tlbdbg) {
-    fprintf(stderr, "[tlb-refill] va=%016llx op=%d asid=%llx pc=%08x\n",
-            (unsigned long long)va, (int)op, (unsigned long long)cur_asid,
-            (uint32_t)s->pc);
-    for(int i = 0; i < state_t::NUM_TLB_ENTRIES; i++) {
-      if((s->tlb[i].entry_lo0 | s->tlb[i].entry_lo1) & 0x2)
-        fprintf(stderr, "   tlb[%2d] hi=%016llx lo0=%016llx lo1=%016llx pm=%08x\n",
-                i, (unsigned long long)s->tlb[i].entry_hi,
-                (unsigned long long)s->tlb[i].entry_lo0,
-                (unsigned long long)s->tlb[i].entry_lo1, s->tlb[i].page_mask);
-    }
-  }
-  uint32_t code = (op == tlb_op::store) ? 3u : 2u;
-  raise_tlb(s, va, code, /*is_refill=*/true, xtlb);
+  fprintf(stderr, "ISS: load from unmodeled pa 0x%llx pc 0x%x\n", static_cast<unsigned long long>(pa), s->pc);
   return 0;
 }
 
-/* PTETRACK (WRTRACK): a MTC0/DMTC0 that writes EntryLo0/1 with a device-space PFN
- * (value bit 22 = PFN bit 16 = PA bit 28, V=1) is installing a user page into the
- * 0x1f000000 MMIO window. Follow it back: the source GPR's load provenance gives the
- * PTE address; read the PTE still in memory and compare. MEM already has bit 28 =>
- * the kernel BUILT the PTE wrong (chase the writer pc). MEM clean => interp corrupted
- * it on the refill LOAD (bug at g_gpr_ld_pc). */
-#ifdef ENABLE_O32_TRACE
-static void ptetrack_probe(state_t *s, uint32_t rd, uint32_t rt) {
-  if(!g_wrtrack) { return; }
-  if(!(rd == CPR0_ENTRYLO0 || rd == CPR0_ENTRYLO1)) { return; }
-  uint32_t v = (uint32_t)s->gpr[rt];
-  uint32_t vpfn = (v >> 6) & 0xfffffffu;
-  if(!(vpfn >= 0x1f000u && vpfn <= 0x1ffffu && ((v >> 1) & 1u))) { return; }  /* PA in device window 0x1f000000-0x1fffffff, V=1 */
-  static int n = 0;
-  if(n++ >= 40) { return; }
-  uint32_t ldva = g_gpr_ld_va[rt], ldpa = g_gpr_ld_pa[rt], ldpc = g_gpr_ld_pc[rt];
-  uint32_t ptemem = 0;
-  if(ldva) { guest_rd32_be(s, (uint64_t)(int64_t)(int32_t)ldva, &ptemem); }
-  uint64_t w = (uint64_t)ldpa >> 2;
-  fprintf(stderr, "[PTETRACK] EntryLo%d=%08x (dev PFN) via r%u pc=%08x icnt=%lu\n",
-          (rd == CPR0_ENTRYLO0) ? 0 : 1, v, rt, (uint32_t)s->pc, (unsigned long)s->icnt);
-  fprintf(stderr, "[PTETRACK]   r%u last LOADED from VA %08x (PA %08x) by pc %08x; PTE-in-mem=%08x  %s\n",
-          rt, ldva, ldpa, ldpc, ptemem,
-          !ldpc ? "(no load provenance -- value came via ALU, not a PTE load)" :
-          (((ptemem >> 22) & 1u) ? "(MEM HAS bit28 -> kernel built PTE wrong)"
-                                 : "(MEM CLEAN -> interp corrupted it on the load)"));
-  fprintf(stderr, "[PTETRACK]   last STORE to that PTE word: pc=%08x icnt=%lu%s\n",
-          g_wr_pc[w], (unsigned long)g_wr_icnt[w],
-          (g_wr_pc[w] == 0 && g_wr_icnt[w] == 0) ? "  (never written -> zero-fill)" : "");
-}
-#else
-static inline void ptetrack_probe(state_t *, uint32_t, uint32_t) {}
-#endif
-
-/* wrapper: feed every successful cacheable DATA access (va,pa) to the VIPT
- * alias-frequency instrument, then return the PA unchanged. */
-
-/* IP22 MC GIO/HPC bus-error decode: a load to an address no slave answers times
- * out and comes back as a data bus error (cause 7).  Two regions Linux's GIO bus
- * probe (arch/mips/sgi-ip22/ip22-gio.c) relies on:
- *   - the second HPC3 (chip1 @0x1fb00000) is not populated on Indy, so the gate
- *     read hpc3c1->pbdma[1] must bus-error for the kernel to probe the GFX slot;
- *   - the Newport GFX slot has no GIO signature at its base (GIO_SLOT_GFX_BASE =
- *     0x1f000000), so reads below the Newport register window (0x1f0f0000) bus-
- *     error, while the Newport USTATUS read at 0x1f0f133c answers -- that is how
- *     ip22_check_gio() tells Newport (id 0x7e) is present.  (Empty EXP0/EXP1 slots
- *     read back 0, which the probe accepts as Empty, so they need no bus error.) */
-static inline bool ip22_gio_bus_error(uint32_t pa) {
-  if(pa >= 0x1fb00000u && pa < 0x1fb80000u) { return true; }        /* HPC3 chip1: absent */
-  if(pa >= 0x1f000000u && pa < 0x1f0f0000u) { return true; }        /* GFX slot base, below Newport */
-  return false;
+template <typename T>
+static void st_phys(state_t *s, uint64_t pa, T v) {
+  if(pa < s->ram_size) {
+    s->mem.set<T>(pa, be(v));
+    return;
+  }
+  if(s->dev) {
+    s->dev->write(s, pa, sizeof(T), v, &s->bus_error);
+    return;
+  }
+  if(s->sun4m) {
+    s->sun4m->write(s, pa, sizeof(T), v, &s->bus_error);
+    return;
+  }
+  fprintf(stderr, "ISS: store to unmodeled pa 0x%llx pc 0x%x\n", static_cast<unsigned long long>(pa), s->pc);
 }
 
-/* PROM memory sizing (ip24prom 0xbfc01070/0xbfc01640): the PROM makes ONE bank valid at
- * base 0x20000000 (MEMCFG field base 0x80, 4 MB units) and probes it uncached -- walking
- * ones (a mismatch = no SIMMs), then aliasing for the size.  Model the henry board: banks
- * 0/1 populated (2 x 128 MB = the 256 MB at 0x08000000..0x17ffffff), banks 2/3 empty.  In
- * the probe window bank 0/1 reach their memory (offset mod 128 MB, so the alias test sizes
- * them at 128 MB); anything else is empty -- loads read 0, stores vanish (two scratch pages
- * that never meet).  Without this every bank probed present and IRIX was told 512 MB, which
- * a real Indy never had and henry does not back.  Mirrors henry_soc.sv w_hi_win. */
-static uint32_t ip22_probe_window(state_t *s, uint32_t pa, tlb_op op) {
-  const uint32_t cfg0 = s->mc->memcfg0_cpu();   /* bank0 [31:16], bank1 [15:0] */
-  if(((cfg0 >> 29) & 1) && ((cfg0 >> 16) & 0xff) == 0x80) {
-    return 0x08000000u | (pa & 0x07ffffffu);
-  }
-  if(((cfg0 >> 13) & 1) && (cfg0 & 0xff) == 0x80) {
-    return 0x10000000u | (pa & 0x07ffffffu);
-  }
-  return (op == tlb_op::store ? 0x2ffff000u : 0x2fffe000u) | (pa & 0xfffu);
+/* ASIs that reach memory: 8/9 user/supervisor insn, 0xa/0xb user/supervisor
+ * data (translated), 0x20-0x2f MMU bypass with PA[35:32] = ASI[3:0] */
+static inline bool asi_is_bypass(uint32_t asi) {
+  return (asi & 0xf0) == 0x20;
 }
 
-/* set by va_translate_slow when its result must not go into the soft TLB (the PROM's bank-
- * probe window maps the same PA to different memory as MEMCFG changes) */
-static bool g_xlat_uncacheable = false;
-
-static __attribute__((noinline)) uint32_t va_translate_slow(state_t *s, uint64_t va, tlb_op op) {
-#ifdef ENABLE_CACHE_MODEL
-  if(g_wsprof && op == tlb_op::store) {                 /* WS profiler markers */
-    uint32_t v32 = (uint32_t)va;
-    if((v32 & 0xfffff000u) == 0x30000000u || (v32 & 0xfffff000u) == 0x30001000u)
-      fprintf(stderr, "### WSMARK store va=%08x\n", v32);
-    if(v32 == 0x30000000u) { g_wsprof->reset(); fprintf(stderr,"### WSRESET\n"); }
-    else if(v32 == 0x30001000u) { g_wsprof->dump("benchmark"); }
-  }
-#endif
-  uint32_t pa = va_translate_inner(s, va, op);
-  g_xlat_uncacheable = false;
-  if((pa >> 28) == 2 && s->mc) {
-    pa = ip22_probe_window(s, pa, op);
-    g_xlat_uncacheable = true;               /* depends on MEMCFG, not the TLB: never cache */
-  }
-  static const bool g_nvlog = getenv("NVLOG") != nullptr;
-  if(g_nvlog and op == tlb_op::load
-     and (((uint32_t)s->pc >= 0x8800ab20u and (uint32_t)s->pc <= 0x8800b0b8u)
-       or ((uint32_t)s->pc >= 0x88059c2cu and (uint32_t)s->pc <= 0x8805a1a0u))) {
-    uint32_t mv = __builtin_bswap32(s->mem.get<uint32_t>(pa & ~3u));
-    fprintf(stderr, "[nv] pc=%08x va=%08x pa=%08x memval=%08x\n",
-            (uint32_t)s->pc, (uint32_t)va, pa, mv);
-  }
-  // watch writes to the ec unit-config flags (0x08308ec0 + n*824 + 0x284) to see
-  // how autoconfig assigns the onboard ethernet its unit number.
-  static const bool g_eccfg = getenv("ECCFG") != nullptr;
-  if(g_eccfg and op == tlb_op::store and (pa & ~0x3u) >= 0x08308ec0u and (pa & ~0x3u) <= 0x08309500u) {
-    fprintf(stderr, "[eccfg] pc=%08x va=%08x pa=%08x (ec-config write)\n",
-            (uint32_t)s->pc, (uint32_t)va, pa);
-  }
-  /* Data bus error on a load the MC can't satisfy.  Checked after translation so a
-   * TLB miss still takes precedence; stores are left alone (the GIO probe loads). */
-  if(op == tlb_op::load && !s->tlb_fault && ip22_gio_bus_error(pa)) {
-    raise_dbe(s);
-  }
-  return pa;
+static inline bool asi_is_memory(uint32_t asi) {
+  return asi == 0x8 or asi == 0x9 or asi == 0xa or asi == 0xb or asi_is_bypass(asi);
 }
 
-/* ---- software TLB for data accesses (Bedichek's figure 5) --------------------------
- * A direct-mapped cache of successful load/store translations to plain RAM, separate
- * for loads and stores (a store entry exists only after a store translated, i.e. the
- * TLB D bit was set), keyed by virtual page + a context word (ASID and the SR mode
- * bits, so ASID or mode changes simply miss).  Flushed with the micro-TLB on tlbwi/
- * tlbwr.  Only RAM PAs are cached: the PROM probe window, GIO bus-error space and the
- * device windows keep their side effects on the slow path.  Off entirely when any of
- * the translation path's debug knobs or the memory hooks are active. */
-struct dfast_t {
-  uint64_t vpage;
-  uint64_t ctx1;                       /* context + 1; 0 = empty */
-  uint32_t ppage;
-  uint32_t writable;                   /* a store translated here (TLB D bit was set) */
-};
-static const uint32_t DFAST_SZ = 256;
-static dfast_t g_dfast[2][DFAST_SZ];   /* [0] data (loads + stores), [1] instruction fetch */
-static const bool g_dfast_on = [](){
-  static const char *knobs[] = {"DEVMAP", "ECCFG", "HEAP_PROBE", "HTRACE", "IDXWR", "MODLOG",
-                                "MODLOG_FLOOR", "NVLOG", "TLBDBG", "WATCHC4", "WATCHVA_ADDR"};
-  for(const char *k : knobs) {
-    if(getenv(k) != nullptr) {
-      return false;
+enum class acc_t { load, store, fetch };
+
+/* SRMMU table walk (no TLB: the ISS walks every access).  Returns FT_NONE with
+ * the PTE, the PA it was read from and its level (0 = context, 4GB; 1 = 16MB;
+ * 2 = 256KB; 3 = 4KB), else the fault type with *level where it hit. */
+static uint32_t srmmu_walk(state_t *s, uint32_t va, uint32_t *pte, uint64_t *pte_pa, uint32_t *level) {
+  uint64_t ea = (static_cast<uint64_t>(s->mmu_ctpr & ~3u) << 4) + 4*static_cast<uint64_t>(s->mmu_ctx);
+  for(uint32_t l = 0; ; l++) {
+    uint32_t e = ld_phys<uint32_t>(s, ea);
+    *level = l;
+    switch(e & 3)
+      {
+      case 2:                 /* PTE */
+	*pte = e;
+	*pte_pa = ea;
+	return FT_NONE;
+      case 0:                 /* invalid */
+	return FT_INVALID;
+      case 3:                 /* reserved */
+	return FT_TRANSLATION;
+      default:
+	break;
+      }
+    if(l == 3) {              /* a PTD at level 3 */
+      return FT_TRANSLATION;
+    }
+    uint32_t idx = (l == 0) ? ((va >> 24) & 0xff) : (l == 1) ? ((va >> 18) & 0x3f) : ((va >> 12) & 0x3f);
+    ea = (static_cast<uint64_t>(e & ~3u) << 4) + 4*idx;
+  }
+}
+
+static inline uint64_t pte_pa_of(uint32_t pte, uint32_t level, uint32_t va) {
+  static const uint32_t off_mask[4] = {0xffffffffu, 0x00ffffffu, 0x0003ffffu, 0x00000fffu};
+  uint64_t base = static_cast<uint64_t>(pte >> 8) << 12;
+  return (base & ~static_cast<uint64_t>(off_mask[level])) | (va & off_mask[level]);
+}
+
+bool debug_walk(state_t *s, uint32_t va, uint32_t *pte, uint32_t *level, uint64_t *pa) {
+  uint64_t pte_pa = 0;
+  if(srmmu_walk(s, va, pte, &pte_pa, level) != FT_NONE) {
+    return false;
+  }
+  *pa = pte_pa_of(*pte, *level, va);
+  return true;
+}
+
+bool debug_fetch(state_t *s, uint32_t va, uint32_t *insn) {
+  uint64_t pa = va;
+  if(not (s->mmu_ctrl & MCR_E)) {
+    if(s->mmu_ctrl & MCR_BMODE) {
+      pa = SUN4M_PROM_BASE | (va & 0x7ffffu);
     }
   }
-  return true;
-}();
-
-static inline uint64_t dfast_ctx(const state_t *) {
-  return g_xctx;
-}
-
-static inline void dfast_flush() {
-  memset(g_dfast, 0, sizeof(g_dfast));
-}
-
-static inline uint32_t va_translate(state_t *s, uint64_t va, tlb_op op) {
-  if(op == tlb_op::fetch && g_uitlb_interval) {
-    return va_translate_slow(s, va, op);     /* UITLBSTATS models every fetch */
+  else {
+    uint32_t pte = 0, level = 0;
+    uint64_t pte_pa = 0;
+    if(srmmu_walk(s, va, &pte, &pte_pa, &level) != FT_NONE) {
+      return false;
+    }
+    pa = pte_pa_of(pte, level, va);
   }
-  const uint64_t vpage = va >> 12;
-  dfast_t &e = g_dfast[op == tlb_op::fetch][vpage & (DFAST_SZ - 1)];
-  const uint64_t ctx1 = dfast_ctx(s) + 1;
-  if(__builtin_expect(e.vpage == vpage && e.ctx1 == ctx1 && (op != tlb_op::store || e.writable), 1)) {
-    return e.ppage | (uint32_t)(va & 0xfffULL);
+  /* RAM and the PROM have no read side effects */
+  if(pa < s->ram_size) {
+    *insn = be(s->mem.get<uint32_t>(pa));
+    return true;
   }
-  const uint32_t pa = va_translate_slow(s, va, op);
-  if(g_dfast_on && !s->tlb_fault && !g_mem_hooks && !g_xlat_uncacheable &&
-     pa >= 0x08000000u && pa < 0x18000000u) {
-    e.writable = (op == tlb_op::store) || (e.vpage == vpage && e.ctx1 == ctx1 && e.writable);
-    e.vpage = vpage;
-    e.ctx1 = ctx1;
-    e.ppage = pa & ~0xfffu;
-  }
-  return pa;
-}
-
-/* Read-only address probe for debug knobs: returns true and sets *pa if va maps
- * to a valid (V=1) physical address, WITHOUT raising any TLB exception (mirrors
- * va_translate's segment + 48-entry lookup, minus the fault paths). */
-static bool tlb_probe_ro(state_t *s, uint64_t va, uint32_t *pa) {
-  uint32_t hi32 = (uint32_t)(va >> 32);
-  uint32_t lo32 = (uint32_t)va;
-  if(hi32 == 0x00000000u || hi32 == 0xffffffffu) {
-    uint32_t seg = lo32 >> 29;
-    if(seg == 0x4 || seg == 0x5) { *pa = lo32 & 0x1fffffff; return true; }
-  } else if(((va >> 62) & 0x3) == 0x2) {
-    *pa = (uint32_t)(va & 0xffffffffffULL); return true;
-  }
-  bool wide = !(hi32 == 0x00000000u || hi32 == 0xffffffffu);
-  uint64_t cur_asid = s->cpr0_64[CPR0_ENTRYHI] & 0xffULL;
-  uint64_t cmp_mask = wide ? ~0x3ULL : 0xffffffffULL;
-  for(int i = 0; i < state_t::NUM_TLB_ENTRIES; i++) {
-    uint64_t pm     = s->tlb[i].page_mask & 0x1ffe000ULL;
-    uint64_t mask   = (~(uint64_t)(pm | 0x1fffULL)) & cmp_mask;
-    uint64_t e_hi   = s->tlb[i].entry_hi;
-    bool global     = (s->tlb[i].entry_lo0 & 1u) && (s->tlb[i].entry_lo1 & 1u);
-    bool vpn_match  = (va & mask) == (e_hi & mask);
-    if(wide) vpn_match = vpn_match && (((va >> 62) & 0x3) == ((e_hi >> 62) & 0x3));
-    bool asid_match = global || (cur_asid == (e_hi & 0xffULL));
-    if(!(vpn_match && asid_match)) continue;
-    uint64_t pair_mask = pm | 0x1fffULL;
-    uint64_t off_mask  = pair_mask >> 1;
-    uint64_t sel_bit   = (pair_mask + 1) >> 1;
-    bool odd           = (va & sel_bit) != 0;
-    uint64_t e_lo      = odd ? s->tlb[i].entry_lo1 : s->tlb[i].entry_lo0;
-    if(!(e_lo & 0x2u)) return false;               /* V == 0 */
-    uint64_t pfn = (e_lo >> 6) & 0xfffffffULL;
-    *pa = (uint32_t)((pfn << 12) | (va & off_mask));
+  if(s->sun4m and pa >= SUN4M_PROM_BASE and pa + 4 <= SUN4M_PROM_BASE + SUN4M_PROM_SIZE) {
+    const uint8_t *p = &s->sun4m->prom[pa - SUN4M_PROM_BASE];
+    *insn = (static_cast<uint32_t>(p[0]) << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
     return true;
   }
   return false;
 }
 
-template <typename T>
-struct c1xExec {
-  void operator()(const mips_t& mi, state_t *s) {
-    const coproc1x_t& insn = mi.c1x;
-    T _fr = *reinterpret_cast<T*>(s->cpr1+insn.fr);
-    T _fs = *reinterpret_cast<T*>(s->cpr1+insn.fs);
-    T _ft = *reinterpret_cast<T*>(s->cpr1+insn.ft);
-    T &_fd = *reinterpret_cast<T*>(s->cpr1+insn.fd);  
-    /* MIPS IV madd/msub/nmadd/nmsub are NOT fused: the product is rounded to the
-     * format first (R5000/R10000; the R8000 was the fused exception).  The volatile
-     * keeps clang -march=native (-ffp-contract=on) from emitting an FMA. */
-    volatile T _p = _fs*_ft;
-    switch(insn.id)
-      {
-      case 4:
-	_fd = _p + _fr;
-	break;
-      case 5:
-	_fd = _p - _fr;
-	break;
-      case 6:
-	_fd = -(_p + _fr);
-	break;
-      case 7:
-	_fd = -(_p - _fr);
-	break;
-      default:
-	std::cerr << "unhandled coproc1x insn @ 0x"
-		  << std::hex << s->pc << std::dec
-		  << ", id = " << insn.id
-		  << " "
-		  << getAsmString(mi.raw, s->pc)
-		  <<"\n";
-	exit(-1);
-      }
-    s->pc += 4;
-  }
-};
-
-
-static inline uint32_t *fpr_hw(state_t *s, uint32_t r);
-static inline uint32_t fpr_dreg(const state_t *s, uint32_t r);
-
-/* lwxc1/ldxc1 and swxc1/sdxc1 use the same FR=0/FR=1 register mapping as
- * lwc1/ldc1/swc1/sdc1: a word access goes through fpr_hw (FR=0 odd = high half
- * of the even reg), a doubleword through fpr_dreg (FR=0 forces even). */
-template <bool EL, typename T>
-void lxc1(uint32_t inst, state_t *s) {
-  mips_t mi(inst);
-  uint32_t ea = va_translate(s, s->gpr[mi.lc1x.base] + s->gpr[mi.lc1x.index], tlb_op::load);
-  if(s->tlb_fault) return;
-  T v = bswap<EL>(s->mem.get<T>(ea));
-  if(sizeof(T) == 4) {
-    *reinterpret_cast<T*>(fpr_hw(s, mi.lc1x.fd)) = v;
-  }
-  else {
-    *reinterpret_cast<T*>(s->cpr1 + fpr_dreg(s, mi.lc1x.fd)) = v;
-  }
-  s->pc += 4;
+/* translation/protection fault.  A fault status not yet read is replaced and
+ * flagged OW (as qemu does). */
+static void mmu_record_fault(state_t *s, uint32_t ft, uint32_t level, uint32_t at, uint32_t va) {
+  uint32_t ow = (s->mmu_fsr != 0) ? MFSR_OW : 0;
+  s->mmu_fsr = (level << MFSR_L_SHIFT) | (at << MFSR_AT_SHIFT) | (ft << MFSR_FT_SHIFT) | MFSR_FAV | ow;
+  s->mmu_far = va;
 }
 
-/* swxc1/sdxc1: FPR[fs] -> mem[base+index]; fs is inst[15:11] (lwxc1_t.pad) */
-template <bool EL, typename T>
-void sxc1(uint32_t inst, state_t *s) {
-  mips_t mi(inst);
-  uint32_t ea = va_translate(s, s->gpr[mi.lc1x.base] + s->gpr[mi.lc1x.index], tlb_op::store);
-  if(s->tlb_fault) return;
-  T v;
-  if(sizeof(T) == 4) {
-    v = *reinterpret_cast<T*>(fpr_hw(s, mi.lc1x.pad));
+/* access bus error (unassigned physical address), recorded as qemu's
+ * sparc_raise_mmu_fault: it does not overwrite a pending translation fault,
+ * sets bit 16 for an explicit-ASI access, and SuperSPARC never puts an
+ * instruction fault address in the FAR.  Returns true if it traps (MMU on and
+ * not no-fault). */
+static bool mmu_bus_error(state_t *s, uint64_t pa, bool is_write, bool is_exec, bool is_asi) {
+  uint32_t prev_ft = (s->mmu_fsr >> MFSR_FT_SHIFT) & 7;
+  s->bus_error = false;
+  if(prev_ft > 4 or prev_ft == 0) {
+    s->mmu_fsr = (is_asi ? (1u << 16) : 0) | (s->s ? (1u << 5) : 0) | (is_exec ? (1u << 6) : 0) |
+      (is_write ? (1u << 7) : 0) | (FT_BUS_ERROR << MFSR_FT_SHIFT) | MFSR_FAV;
+    if(not is_exec) {
+      s->mmu_far = static_cast<uint32_t>(pa);
+    }
   }
-  else {
-    v = *reinterpret_cast<T*>(s->cpr1 + fpr_dreg(s, mi.lc1x.pad));
+  if(prev_ft == ((s->mmu_fsr >> MFSR_FT_SHIFT) & 7)) {
+    s->mmu_fsr |= MFSR_OW;
   }
-  s->mem.set<T>(ea, bswap<EL>(v));
-  s->pc += 4;
+  return (s->mmu_ctrl & MCR_E) and not (s->mmu_ctrl & MCR_NF);
 }
 
-template <bool EL>
-static void execCoproc1x(uint32_t inst, state_t *s) {
-  mips_t mi(inst);
-
-  switch(mi.lc1x.id)
-    {
-    case 0:
-      //lwxc1
-      lxc1<EL,int32_t>(inst, s);
-      return;
-    case 1:
-      //ldxc1
-      lxc1<EL,int64_t>(inst, s);
-      return;
-    case 8:
-      //swxc1
-      sxc1<EL,int32_t>(inst, s);
-      return;
-    case 9:
-      //sdxc1
-      sxc1<EL,int64_t>(inst, s);
-      return;
-    case 15:
-      //prefx: a hint, like pref
-      s->pc += 4;
-      return;
-    default:
-      break;
-    }
-  
-  /* madd/msub/nmadd/nmsub are id 4..7 with fmt S (0) or D (1).  Everything else
-   * -- luxc1/suxc1 and paired-single are MIPS V, the rest unused -- is RI on the
-   * R5000, not a reason to stop the simulator. */
-  if((mi.c1x.id < 4) || (mi.c1x.fmt > 1)) {
-    raise_ri(s, inst);
-    return;
+/* Translate va for an access through a memory ASI.  Returns FT_NONE and *pa, or
+ * the fault type (already recorded in the fault status/address registers). */
+static uint32_t mmu_xlate(state_t *s, uint32_t asi, uint32_t va, acc_t acc, uint64_t *pa) {
+  if(asi_is_bypass(asi)) {
+    *pa = (static_cast<uint64_t>(asi & 0xf) << 32) | va;
+    return FT_NONE;
   }
-  if(mi.c1x.fmt == 0) {
-    c1xExec<float> e;
-    e(mi, s);
-    s->cpr1_state[mi.c1x.fd] = fp_reg_state::sp;
-  }
-  else {
-    c1xExec<double> e;
-    e(mi, s);
-    s->cpr1_state[mi.c1x.fd] = fp_reg_state::dp;
-  }
-}
-
-
-
-/* FASTDELAY: collapse calibrated busy-delay loops (e.g. IRIX us_delay/delayloop,
- * Linux __delay). A delay loop is a conditional branch back to its OWN address
- * (imm==-4: 2-insn loop = branch + its delay slot) that compares ONE register
- * against zero; the delay slot only decrements/increments that register, touching
- * no memory or device. Spinning the full faithful count is hundreds of millions
- * of ISS instructions per call. When enabled, clamp the counter to the exit
- * boundary so the loop terminates in one more iteration (the delay slot still
- * does the final step, so the architectural state stays consistent). Off by
- * default -- it skips wall-time the guest intended to burn, so leave it off for
- * cycle-accurate co-sim. */
-static const bool g_fastdelay = getenv("FASTDELAY") != nullptr;
-
-template <bool EL, branch_type bt>
-void branch(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = ((int32_t)himm) << 2;
-  state_t::reg_t npc = s->pc+4; 
-  bool isLikely = false, takeBranch = false, saveReturn = false;
-  switch(bt)
-    {
-    case branch_type::beql:
-      takeBranch = (s->gpr[rt] == s->gpr[rs]);
-      HISTO(s, mipsInsn::BEQL);
-      isLikely = true;
-      break;
-    case branch_type::beq:
-      takeBranch = (s->gpr[rt] == s->gpr[rs]);
-      HISTO(s, mipsInsn::BEQ);
-      break;
-    case branch_type::bnel:
-      isLikely = true;
-      takeBranch = (s->gpr[rt] != s->gpr[rs]);
-      HISTO(s, mipsInsn::BNEL);
-      break;
-    case branch_type::bne:
-      takeBranch = (s->gpr[rt] != s->gpr[rs]);
-      HISTO(s, mipsInsn::BNE);
-      break;
-    case branch_type::blezl:
-      isLikely = true;
-      takeBranch = (s->gpr[rs] <= 0);
-      HISTO(s, mipsInsn::BLEZL);
-      break;
-    case branch_type::blez:
-      takeBranch = (s->gpr[rs] <= 0);
-      HISTO(s, mipsInsn::BLEZ);
-      break;
-    case branch_type::bgtzl:
-      isLikely = true;
-      takeBranch = (s->gpr[rs] > 0);
-      HISTO(s, mipsInsn::BGTZL);
-      break;
-    case branch_type::bgtz:
-      takeBranch = (s->gpr[rs] > 0);
-      HISTO(s, mipsInsn::BGTZ);
-      break;
-    case branch_type::bgezl:
-      isLikely = true;
-      takeBranch = (s->gpr[rs] >= 0);
-      HISTO(s, mipsInsn::BGEZL);
-      break;      
-    case branch_type::bgez:
-      takeBranch = (s->gpr[rs] >= 0);
-      HISTO(s, mipsInsn::BGEZ);
-      break;
-    case branch_type::bltzl:
-      isLikely = true;
-      takeBranch = (s->gpr[rs] < 0);
-      HISTO(s, mipsInsn::BLTZL);
-      break;
-    case branch_type::bltz:
-      takeBranch = (s->gpr[rs] < 0);
-      HISTO(s, mipsInsn::BLTZ);
-      break;
-    case branch_type::bgezal:
-      takeBranch = (s->gpr[rs] >= 0);
-      HISTO(s, mipsInsn::BGEZAL);
-      saveReturn = true;
-      break;
-    case branch_type::bltzal:
-      takeBranch = (s->gpr[rs] < 0);
-      HISTO(s, mipsInsn::BLTZAL);
-      saveReturn = true;
-      break;
-    case branch_type::bgezall:
-      isLikely = true;
-      takeBranch = (s->gpr[rs] >= 0);
-      HISTO(s, mipsInsn::BGEZALL);
-      saveReturn = true;
-      break;
-    case branch_type::bltzall:
-      isLikely = true;
-      takeBranch = (s->gpr[rs] < 0);
-      HISTO(s, mipsInsn::BLTZALL);
-      saveReturn = true;
-      break;
-    case branch_type::bc1tl:
-      isLikely = true;
-      takeBranch = getConditionCode(s,((inst>>18)&7))==1;
-      HISTO(s, mipsInsn::BC1TL);
-      break;
-    case branch_type::bc1t:
-      takeBranch = getConditionCode(s,((inst>>18)&7))==1;
-      HISTO(s, mipsInsn::BC1T);
-      break;
-    case branch_type::bc1fl:
-      isLikely = true;
-      takeBranch = getConditionCode(s,((inst>>18)&7))==0;
-      HISTO(s, mipsInsn::BC1FL);
-      break;
-    case branch_type::bc1f:
-      takeBranch = getConditionCode(s,((inst>>18)&7))==0;
-      HISTO(s, mipsInsn::BC1F);
-      break;
-    default:
-      UNREACHABLE();
-    }
-
-  /* FASTDELAY: self-branch compare-against-zero delay loop -> clamp the counter
-   * to the exit boundary so the (large) calibrated spin collapses to one more
-   * iteration. The delay slot below performs the final decrement/increment. */
-  if(g_fastdelay && takeBranch && !isLikely && imm == -4) {
-    state_t::reg_t v = s->gpr[rs];
-    switch(bt) {
-    case branch_type::bgtz: if(v >  0x10000) s->gpr[rs] =  1; break; /* exit rs<=0 */
-    case branch_type::bltz: if(v < -0x10000) s->gpr[rs] = -1; break; /* exit rs>=0 */
-    case branch_type::blez: if(v < -0x10000) s->gpr[rs] =  0; break; /* exit rs>0  */
-    case branch_type::bgez: if(v >  0x10000) s->gpr[rs] =  0; break; /* exit rs<0  */
-    default: break;
-    }
-  }
-
-  s->pc += 4;
-  if(isLikely) {
-    /* BLTZALL/BGEZALL: the link (ra <- pc+8) is UNCONDITIONAL -- only the branch
-     * direction depends on the condition.  Must fire even when NOT taken. */
-    if(saveReturn)
-      s->gpr[31] = npc + 4;   /* full 64-bit link (n64 user PCs exceed 32 bits) */
-    if(takeBranch) {
-      if(!run_delay_slot<EL>(s))
-	s->pc = (imm+npc);
+  if(not (s->mmu_ctrl & MCR_E)) {
+    /* Viking boot mode: MMU-off instruction-space accesses come from the PROM
+     * (offset masked to 512KB, as qemu does): fetches, and loads through the
+     * instruction ASIs 8/9 (OBP's POST reads its tables with lduba ASI 9; qemu
+     * treats those ASIs as code accesses).  Data ASIs go to RAM. */
+    if(acc != acc_t::store and (acc == acc_t::fetch or asi == 0x8 or asi == 0x9) and (s->mmu_ctrl & MCR_BMODE)) {
+      *pa = SUN4M_PROM_BASE | (va & 0x7ffffu);
     }
     else {
-      s->pc += 4;
+      *pa = va;
+    }
+    return FT_NONE;
+  }
+  /* ACC permissions: bit 0 = read, 1 = write, 2 = execute */
+  static const uint8_t perm_user[8] = {1, 3, 5, 7, 4, 1, 0, 0};
+  static const uint8_t perm_super[8] = {1, 3, 5, 7, 4, 3, 5, 7};
+  const bool super = (asi == 0x9 or asi == 0xb);
+  const uint32_t at = ((acc == acc_t::store) ? 4 : 0) | ((acc == acc_t::fetch) ? 2 : 0) | (super ? 1 : 0);
+  uint32_t pte = 0, level = 0;
+  uint64_t pte_pa = 0;
+  uint32_t ft = srmmu_walk(s, va, &pte, &pte_pa, &level);
+  if(ft == FT_NONE) {
+    uint32_t a = (pte >> 2) & 7;
+    uint32_t need = (acc == acc_t::load) ? 1 : (acc == acc_t::store) ? 2 : 4;
+    if(not ((super ? perm_super[a] : perm_user[a]) & need)) {
+      ft = (not super and a >= 6) ? FT_PRIVILEGE : FT_PROTECTION;
     }
   }
-  else {
-    /* BLTZAL/BGEZAL: link UNCONDITIONALLY (not gated on takeBranch).  The PIC
-     * bootstrap idiom `bltzal rX,.+8` with rX>=0 is the not-taken-but-must-link
-     * case -- gating the link on takeBranch left ra=0 -> wrong load bias.
-     * Link BEFORE the delay slot, as jal/jalr do: the delay slot must see the new
-     * r31.  IRIX GL's `bal X; move v1,ra` (pmovedrawasm.s) took the stale ra, so
-     * __pstore_zb's `jr v1` jumped to itself forever (fsn hang).  A faulting delay
-     * slot re-executes the branch (EPC = branch, BD=1), rewriting the same link. */
-    if(saveReturn) {
-      s->gpr[31] = npc + 4;   /* full 64-bit link (n64 user PCs exceed 32 bits) */
-    }
-    bool ds_faulted = run_delay_slot<EL>(s);
-    if(takeBranch){
-      if(!ds_faulted)
-	s->pc = (imm+npc);
-    }
+  if(ft != FT_NONE) {
+    mmu_record_fault(s, ft, level, at, va);
+    return ft;
   }
+  /* referenced on every access, modified on a store */
+  uint32_t npte = pte | (1u << 5) | ((acc == acc_t::store) ? (1u << 6) : 0);
+  if(npte != pte) {
+    st_phys<uint32_t>(s, pte_pa, npte);
+  }
+  *pa = pte_pa_of(pte, level, va);
+  return FT_NONE;
 }
 
-template <bool EL>
-void _bgez_bltz(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  switch(rt)
+/* Viking cache/tag/flush ASIs: no caches are modeled, so loads read 0 (every tag
+ * invalid, which ends Linux's tag-walking flush loops) and stores are dropped.
+ * 0xc-0xf are the SuperSPARC I/D-cache tag and data diagnostics (OpenBIOS
+ * clears the tags at startup). */
+static inline bool asi_is_viking_cache(uint32_t asi) {
+  return (asi >= 0xc and asi <= 0xf) or (asi >= 0x10 and asi <= 0x14) or asi == 0x18 or
+    (asi >= 0x36 and asi <= 0x3f);
+}
+
+/* the ASI 0x2 module register a word address selects (the high word of the
+ * 64-bit register at +0, the low word at +4), or -1 */
+static int mxcc_reg(uint32_t va) {
+  switch(va & ~7u)
     {
-    case 0:
-      branch<EL,branch_type::bltz>(inst, s);
-      break;
-    case 1:
-      branch<EL,branch_type::bgez>(inst, s);
-      break;
-    case 2:
-      branch<EL,branch_type::bltzl>(inst, s);
-      break;
-    case 3:
-      branch<EL,branch_type::bgezl>(inst, s);
-      break;
-    case 17:
-      branch<EL,branch_type::bgezal>(inst, s);
-      break;
-    case 16:
-      branch<EL,branch_type::bltzal>(inst, s);
-      break;
-    case 18:
-      branch<EL,branch_type::bltzall>(inst, s);
-      break;
-    case 19:
-      branch<EL,branch_type::bgezall>(inst, s);
-      break;
-    case 8: case 9: case 10: case 11: case 12: case 14: { /* trap-immediates */
-      uint32_t rs = (inst >> 21) & 31;
-      int64_t a = (int64_t)s->gpr[rs];
-      int64_t simm = (int64_t)(int16_t)(inst & 0xffff);
-      bool trap = false;
-      switch(rt) {
-      case 8:  trap = (a >= simm);                           HISTO(s, mipsInsn::TGEI);  break;
-      case 9:  trap = ((uint64_t)a >= (uint64_t)simm);       HISTO(s, mipsInsn::TGEIU); break;
-      case 10: trap = (a < simm);                            HISTO(s, mipsInsn::TLTI);  break;
-      case 11: trap = ((uint64_t)a < (uint64_t)simm);        HISTO(s, mipsInsn::TLTIU); break;
-      case 12: trap = (a == simm);                           HISTO(s, mipsInsn::TEQI);  break;
-      case 14: trap = (a != simm);                           HISTO(s, mipsInsn::TNEI);  break;
-      }
-      if(trap) raise_trap(s); else s->pc += 4;
-      break;
-    }
-    default:
-      std::cerr << "case " << rt << " not handled!\n";
-      exit(-1);
+    case 0x01c00a00: return 3;
+    case 0x01c00c00: return 5;
+    case 0x01c00e00: return 6;
+    case 0x01c00f00: return 7;
+    default: return -1;
     }
 }
 
-
-template <bool EL>
-void _lw(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::load);
-  if(s->tlb_fault) return;
-  if(ea & 3) { raise_adel(s); return; }
-  s->gpr[rt] = bswap<EL>(s->mem.get<int32_t>(ea));
-#ifdef ENABLE_O32_TRACE
-  if(unlikely(g_wrtrack)) { g_gpr_ld_va[rt] = (uint32_t)(s->gpr[rs] + imm); g_gpr_ld_pa[rt] = ea; g_gpr_ld_pc[rt] = (uint32_t)s->pc; }
-#endif
-  //#define TRACE_MEM
-  //printf("_lw pc %x from ea %x = %x\n", s->pc, (uint32_t)s->gpr[rs] + imm,
-  //s->gpr[rt]);
-  //#undef TRACE_MEM
-  s->pc += 4;
-  HISTO(s, mipsInsn::LW);
-}
-
-template <bool EL>
-void _lh(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::load);
-  if(s->tlb_fault) return;
-  if(ea & 1) { raise_adel(s); return; }
-  int16_t mem = bswap<EL>(s->mem.get<int16_t>(ea));
-  
-  s->gpr[rt] = static_cast<int32_t>(mem);
-#ifdef TRACE_MEM
-  printf("_lh from %x = %x\n", ea, s->gpr[rt]);
-#endif
-  s->pc +=4;
-  HISTO(s, mipsInsn::LH);  
-}
-
-
-static void _lb(uint32_t inst, state_t *s){
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-  
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::load);
-  if(s->tlb_fault) return;
-  s->gpr[rt] = static_cast<int32_t>(s->mem.get<int8_t>(ea));
-#ifdef TRACE_MEM
-  printf("_lb from %x = %x\n", ea, s->gpr[rt]);
-#endif  
-  s->pc += 4;
-  HISTO(s, mipsInsn::LB);  
-}
-
-static void _lbu(uint32_t inst, state_t *s){
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::load);
-  if(s->tlb_fault) return;
-  uint32_t zExt = s->mem.get<uint8_t>(ea);
-  *((uint64_t*)&(s->gpr[rt])) = zExt;
-  s->pc += 4;
-  HISTO(s, mipsInsn::LBU);
-}
-
-
-template <bool EL>
-void _lhu(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::load);
-  if(s->tlb_fault) return;
-  if(ea & 1) { raise_adel(s); return; }
-  uint32_t zExt = bswap<EL>(s->mem.get<uint16_t>(ea));
-  *((uint64_t*)&(s->gpr[rt])) = zExt;
-  //printf("_lhu from %x = %x\n", ea, s->gpr[rt]);  
-  s->pc += 4;
-  HISTO(s, mipsInsn::LHU);  
-}
-
-
-template <bool EL>
-void _sw(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::store);
-  if(s->tlb_fault) return;
-  if(ea & 3) { raise_ades(s); return; }
-  s->mem.set<int32_t>(ea,  bswap<EL>(static_cast<int32_t>(s->gpr[rt])));
-  s->pc += 4;
-  HISTO(s, mipsInsn::SW);
-}
-
-template <bool EL>
-void _sd(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int32_t imm = (int32_t)(int16_t)(inst & 0xffffu);
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::store);
-  if(s->tlb_fault) return;
-  if(ea & 7) { raise_ades(s); return; }
-  s->mem.set<int64_t>(ea, bswap<EL>(s->gpr[rt]));
-  s->pc += 4;
-  HISTO(s, mipsInsn::SD);
-}
-
-template <bool EL>
-void _ld(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int32_t imm = (int32_t)(int16_t)(inst & 0xffffu);
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::load);
-  if(s->tlb_fault) return;
-  if(ea & 7) { raise_adel(s); return; }
-  s->gpr[rt] = bswap<EL>(s->mem.get<int64_t>(ea));
-#ifdef ENABLE_O32_TRACE
-  if(unlikely(g_wrtrack)) { g_gpr_ld_va[rt] = (uint32_t)(s->gpr[rs] + imm); g_gpr_ld_pa[rt] = ea; g_gpr_ld_pc[rt] = (uint32_t)s->pc; }
-#endif
-  s->pc += 4;
-  HISTO(s, mipsInsn::LD);
-}
-
-template <bool EL>
-void _sc(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-  { static const bool g_t = getenv("LLSC_TRACE")!=nullptr; static uint64_t nk=0,nu=0;
-    bool user = ((uint32_t)s->pc) < 0x80000000u;
-    if(user) nu++; else nk++;
-    if(g_t && (user || ((nk&0xffff)==0)))
-      fprintf(stderr,"[SC] %s pc=%08x ea=%08x val=%08x icnt=%llu (user=%llu kern=%llu)\n",
-        user?"USER":"kern",(uint32_t)s->pc,(uint32_t)(s->gpr[rs]+imm),(uint32_t)s->gpr[rt],
-        (unsigned long long)s->icnt,(unsigned long long)nu,(unsigned long long)nk); }
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::store);
-  if(s->tlb_fault) return;
-  /* SC succeeds only if the LL reservation survived: an exception/ERET between
-   * ll and sc (e.g. an interrupt that context-switches to another thread which
-   * updates the word) must fail it.  Always-succeed lost IRIX mutex waiter bits
-   * (mutex_unlock's CAS overwrote owner|WAITER with 0 -> no mutex_wake; Xsgi
-   * slept forever in socket_pair_cmplock, fsn hung in validate_pane_buffer). */
-  if(s->ll_armed) {
-    s->mem.set<int32_t>(ea,  bswap<EL>(static_cast<int32_t>(s->gpr[rt])));
+/* non-memory ASIs (lda/sta): module registers (0x2), SRMMU probe/flush (0x3)
+ * and registers (0x4) */
+static uint32_t asi_load(state_t *s, uint32_t asi, uint32_t va) {
+  if(asi == 0x2 and va >= 0x01c00000 and va < 0x01c00020) {
+    uint64_t d = s->mxccdata[(va >> 3) & 3];
+    return (va & 4) ? static_cast<uint32_t>(d) : static_cast<uint32_t>(d >> 32);
   }
-  s->gpr[rt] = s->ll_armed ? 1 : 0;
-  s->pc += 4;
-  HISTO(s, mipsInsn::SC);
-}
-
-template <bool EL>
-void _scd(uint32_t inst, state_t *s) {
-  /* store conditional doubleword (mirrors _sc: fails without the LL reservation) */
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::store);
-  if(s->tlb_fault) return;
-  if(s->ll_armed) {
-    s->mem.set<int64_t>(ea, bswap<EL>(static_cast<int64_t>(s->gpr[rt])));
+  if(asi == 0x2 and mxcc_reg(va) >= 0) {
+    uint64_t r = s->mxcc[mxcc_reg(va)];
+    return (va & 4) ? static_cast<uint32_t>(r) : static_cast<uint32_t>(r >> 32);
   }
-  s->gpr[rt] = s->ll_armed ? 1 : 0;
-  s->pc += 4;
-  HISTO(s, mipsInsn::SC);
-}
-
-
-template <bool EL>
-void _sh(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-    
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::store);
-  if(s->tlb_fault) return;
-  if(ea & 1) { raise_ades(s); return; }
-  s->mem.set<int16_t>(ea,  bswap<EL>(((int16_t)s->gpr[rt])));
-  s->pc += 4;
-  HISTO(s, mipsInsn::SH);
-}
-
-static void _sb(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-    
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::store);
-  if(s->tlb_fault) return;
-  s->mem.set<uint8_t>(ea, static_cast<uint8_t>(s->gpr[rt]));
-  
-  s->pc +=4;
-  HISTO(s, mipsInsn::SB);
-}
-
-/* r9999 FR=0 FP register model (mirror decode_mips.sv).  FR=1: 32 flat 64-bit
- * regs, single = low 32.  FR=0: 16 even regs -- a single-precision reg r lives in
- * the (r&1 ? high : low) 32-bit half of cpr1[r & ~1] (even=low, odd=high), and a
- * 64-bit (ldc1/sdc1) access forces the reg even (r & ~1). */
-static inline bool fpr_fr1(const state_t *s) { return (s->cpr0[CPR0_SR] >> 26) & 1u; }
-static inline uint32_t *fpr_hw(state_t *s, uint32_t r) {
-  uint32_t reg = fpr_fr1(s) ? r : (r & ~1u);
-  uint32_t hi  = fpr_fr1(s) ? 0u : (r & 1u);
-  return reinterpret_cast<uint32_t*>(&s->cpr1[reg]) + hi;
-}
-static inline uint32_t fpr_dreg(const state_t *s, uint32_t r) {
-  return fpr_fr1(s) ? r : (r & ~1u);
-}
-
-static void _mtc1(uint32_t inst, state_t *s) {
-  uint32_t fs = (inst>>11) & 31;
-  uint32_t rt = (inst>>16) & 31;
-  /* FR=1: FPR[fs]=sign_extend32(GPR[rt][31:0]).  FR=0: write the fs[0]-selected
-   * 32b half of the even reg, preserving the other half (r9999 mtc1 merge). */
-  if(fpr_fr1(s)) { s->cpr1[fs] = (uint64_t)(int64_t)(int32_t)(uint32_t)s->gpr[rt]; }
-  else           { *fpr_hw(s, fs) = (uint32_t)s->gpr[rt]; }
-  s->pc += 4;
-  HISTO(s, mipsInsn::MTC1);
-}
-
-static void _mfc1(uint32_t inst, state_t *s) {
-  uint32_t fs = (inst>>11) & 31;
-  uint32_t rt = (inst>>16) & 31;
-  /* FR=1: GPR[rt]=sign_extend32(FPR[fs][31:0]).  FR=0: extract the fs[0] half. */
-  s->gpr[rt] = (int64_t)(int32_t)(*fpr_hw(s, fs));
-  s->pc +=4;
-  HISTO(s, mipsInsn::MFC1);
-}
-
-static void _dmtc1(uint32_t inst, state_t *s) {
-  uint32_t fs = (inst>>11) & 31;
-  uint32_t rt = (inst>>16) & 31;
-  /* FR=1: FPR[fs] = GPR[rt] (full 64-bit, no sign-ext) */
-  s->cpr1[fs] = s->gpr[rt];
-  s->pc += 4;
-  HISTO(s, mipsInsn::DMTC1);
-}
-
-static void _dmfc1(uint32_t inst, state_t *s) {
-  uint32_t fs = (inst>>11) & 31;
-  uint32_t rt = (inst>>16) & 31;
-  /* FR=1: GPR[rt] = FPR[fs] (full 64-bit) */
-  s->gpr[rt] = s->cpr1[fs];
-  s->pc += 4;
-  HISTO(s, mipsInsn::DMFC1);
-}
-
-/* map a raw FP control-register number to the compact fcr1[] index */
-static inline int fcr_index(uint32_t cr) {
-  switch(cr) {
-  case 0:  return CP1_CR0;   /* FIR  */
-  case 31: return CP1_CR31;  /* FCSR */
-  case 25: return CP1_CR25;
-  case 26: return CP1_CR26;
-  case 28: return CP1_CR28;
-  default: return CP1_CR31;
+  if(asi == 0x3) {          /* probe: the PTE, or 0 (only the "entire" type 4 walk is modeled) */
+    uint32_t pte = 0, level = 0;
+    uint64_t pte_pa = 0;
+    return (srmmu_walk(s, va & ~0xfffu, &pte, &pte_pa, &level) == FT_NONE) ? pte : 0;
   }
-}
-
-static void _cfc1(uint32_t inst, state_t *s) {
-  uint32_t cr = (inst>>11) & 31;
-  uint32_t rt = (inst>>16) & 31;
-  /* GPR[rt] = sign_extend32(FCR[cr]); FCR0 is the read-only FIR */
-  uint32_t v = (cr == 0) ? (globals::cpu_r5000 ? 0x00002320u : 0x00000500u) : (uint32_t)s->fcr1[fcr_index(cr)];
-  s->gpr[rt] = (int64_t)(int32_t)v;
-  s->pc += 4;
-  HISTO(s, mipsInsn::CFC1);
-}
-
-static void _ctc1(uint32_t inst, state_t *s) {
-  uint32_t cr = (inst>>11) & 31;
-  uint32_t rt = (inst>>16) & 31;
-  /* FCR[cr] = GPR[rt][31:0]; FCR0 (FIR) is read-only.  FCSR and FCCR are two
-   * views of the same condition-code bits, so a write to either must update the
-   * other -- this is the path an FP context restore takes. */
-  if(cr != 0) {
-    s->fcr1[fcr_index(cr)] = (uint32_t)s->gpr[rt];
-    if(cr == 31) {
-      fcc_mirror_to_fccr(s);
-    }
-    else if(cr == 25) {
-      fcc_mirror_from_fccr(s);
-    }
-  }
-  s->pc += 4;
-  HISTO(s, mipsInsn::CTC1);
-}
-
-
-template <bool EL>
-void _swl(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::store);
-  if(s->tlb_fault) return;
-  uint32_t ma = ea & 3;
-  ea &= 0xfffffffc;
-  if(EL)
-    ma = 3 - ma;
-  uint32_t r = bswap<EL>(s->mem.get<uint32_t>(ea));   
-  uint32_t xx=0,x = s->gpr[rt];
-  
-  uint32_t xs = x >> (8*ma);
-  /* 64-bit shift: at ma==0 the count is 32, a 32-bit-shift UB (x86 masks to 0,
-   * making m=0xffffffff and storing r|rt instead of rt). */
-  uint32_t m = (uint32_t)~(((uint64_t)1u << (8*(4 - ma))) - 1);
-  xx = (r & m) | xs;
-  //std::cout << "SIM SWL EA " << std::hex << ea
-  //<< ", MA = " << ma
-  //<< ", X = " << x
-  //<< ", R = " << r
-  //<< ", M = " << m
-  //	    << ", XX = " << xx << std::dec << "\n";
-  
-  s->mem.set<uint32_t>(ea, bswap<EL>(xx));
-  s->pc += 4;
-  HISTO(s, mipsInsn::SWL);  
-}
-
-template <bool EL>
-void _swr(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::store);
-  if(s->tlb_fault) return;
-  uint32_t ma = ea & 3;
-  if(EL)
-    ma = 3 - ma;
-  ea &= ~(3U);
-  uint32_t r = bswap<EL>(s->mem.get<uint32_t>(ea));   
-  uint32_t xx=0,x = s->gpr[rt];
-  
-  uint32_t xs = 8*(3-ma);
-  uint32_t rm = (1U << xs) - 1;
-
-  xx = (x << xs) | (rm & r);
-  s->mem.set<uint32_t>(ea, bswap<EL>(xx));
-  s->pc += 4;
-  HISTO(s, mipsInsn::SWR);
-}
-
-template <bool EL>
-void _lwl(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-  
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::load);
-  if(s->tlb_fault) return;
-  uint32_t u_ea = ea;
-  uint32_t ma = ea & 3;
-  ea &= 0xfffffffc;
-  if(EL)
-    ma = 3 - ma;
-  uint32_t r = bswap<EL>(s->mem.get<uint32_t>(ea));
-  state_t::reg_t x =  s->gpr[rt];
-  
-  switch(ma)
-    {
-    case 0:
-      s->gpr[rt] = sext64(r);
-      break;
-    case 1:
-      s->gpr[rt] = sext64(((r & 0x00ffffff) << 8) | (x & 0x000000ff)) ;
-      break;
-    case 2:
-      s->gpr[rt] = sext64(((r & 0x0000ffff) << 16)  | (x & 0x0000ffff)) ;
-      break;
-    case 3:
-      s->gpr[rt] = sext64(((r & 0x00ffffff) << 24)  | (x & 0x00ffffff));
-      break;
-    }
-#ifdef TRACE_MEM
-  printf("_lwl from %x = %x\n", u_ea, s->gpr[rt]);
-#endif  
-  s->pc += 4;
-  HISTO(s, mipsInsn::LWL);  
-}
-
-template<bool EL>
-void _lwr(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
- 
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::load);
-  if(s->tlb_fault) return;
-  uint32_t u_ea = ea;
-  uint32_t ma = ea & 3;
-  ea &= 0xfffffffc;
-  if(EL)
-    ma = 3-ma;
-
-  uint32_t r = bswap<EL>(s->mem.get<uint32_t>(ea));
-  state_t::reg_t x =  s->gpr[rt];
-  
-  switch(ma)
-    {
-    case 0:
-      s->gpr[rt] = sext64((x & 0xffffff00) | (r>>24));
-      break;
-    case 1:
-      s->gpr[rt] = sext64((x & 0xffff0000) | (r>>16));
-      break;
-    case 2:
-      s->gpr[rt] = sext64((x & 0xff000000) | (r>>8));
-      break;
-    case 3:
-      s->gpr[rt] = sext64(r);
-      break;
-    }
-
-#ifdef TRACE_MEM
-  printf("_lwr from %x = %x (x=%x, r = %x)\n", u_ea, s->gpr[rt], x, r);
-#endif  
-  
-  s->pc += 4;
-  HISTO(s, mipsInsn::LWR);
-}
-
-template <bool EL>
-void _ldl(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int32_t imm = (int32_t)(int16_t)(inst & 0xffff);
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::load);
-  if(s->tlb_fault) return;
-  uint32_t ma = ea & 7;
-  ea &= ~7u;
-  if(EL) ma = 7 - ma;
-  uint64_t r = bswap<EL>(s->mem.get<uint64_t>(ea));
-  uint64_t x = s->gpr[rt];
-  /* Load (8-ma) bytes from positions [ma..7] of aligned dword into rt[63:ma*8].
-   * In BE: r[63:56]=pos0, r[7:0]=pos7.  Bytes [ma..7] = r[(8-ma)*8-1:0].
-   * Shift them left by ma*8 to place at rt[63:ma*8]. */
-  switch(ma) {
-    case 0: s->gpr[rt] = r; break;
-    case 1: s->gpr[rt] = (r & 0x00ffffffffffffffULL) << 8  | (x & 0xffULL); break;
-    case 2: s->gpr[rt] = (r & 0x0000ffffffffffffULL) << 16 | (x & 0xffffULL); break;
-    case 3: s->gpr[rt] = (r & 0x000000ffffffffffULL) << 24 | (x & 0xffffffULL); break;
-    case 4: s->gpr[rt] = (r & 0x00000000ffffffffULL) << 32 | (x & 0xffffffffULL); break;
-    case 5: s->gpr[rt] = (r & 0x0000000000ffffffULL) << 40 | (x & 0xffffffffffULL); break;
-    case 6: s->gpr[rt] = (r & 0x000000000000ffffULL) << 48 | (x & 0xffffffffffffULL); break;
-    case 7: s->gpr[rt] = (r & 0x00000000000000ffULL) << 56 | (x & 0x00ffffffffffffffULL); break;
-  }
-  s->pc += 4;
-  HISTO(s, mipsInsn::LDL);
-}
-
-template <bool EL>
-void _ldr(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int32_t imm = (int32_t)(int16_t)(inst & 0xffff);
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::load);
-  if(s->tlb_fault) return;
-  uint32_t ma = ea & 7;
-  ea &= ~7u;
-  if(EL) ma = 7 - ma;
-  uint64_t r = bswap<EL>(s->mem.get<uint64_t>(ea));
-  uint64_t x = s->gpr[rt];
-  /* Load (ma+1) bytes from positions [0..ma] of aligned dword into rt[(ma+1)*8-1:0].
-   * Bytes [0..ma] = r[63:63-ma*8].  Shift right by (7-ma)*8 to place at rt[(ma+1)*8-1:0]. */
-  switch(ma) {
-    case 0: s->gpr[rt] = (x & 0xffffffffffffff00ULL) | (r >> 56); break;
-    case 1: s->gpr[rt] = (x & 0xffffffffffff0000ULL) | (r >> 48); break;
-    case 2: s->gpr[rt] = (x & 0xffffffffff000000ULL) | (r >> 40); break;
-    case 3: s->gpr[rt] = (x & 0xffffffff00000000ULL) | (r >> 32); break;
-    case 4: s->gpr[rt] = (x & 0xffffff0000000000ULL) | (r >> 24); break;
-    case 5: s->gpr[rt] = (x & 0xffff000000000000ULL) | (r >> 16); break;
-    case 6: s->gpr[rt] = (x & 0xff00000000000000ULL) | (r >>  8); break;
-    case 7: s->gpr[rt] = r; break;
-  }
-  s->pc += 4;
-  HISTO(s, mipsInsn::LDR);
-}
-
-template <bool EL>
-void _sdl(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int32_t imm = (int32_t)(int16_t)(inst & 0xffff);
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::store);
-  if(s->tlb_fault) return;
-  uint32_t ma = ea & 7;
-  ea &= ~7u;
-  if(EL) ma = 7 - ma;
-  uint64_t r = bswap<EL>(s->mem.get<uint64_t>(ea));
-  uint64_t x = s->gpr[rt];
-  /* SDL: store x's high (8-ma) bytes at memory positions [ma..7];
-   * preserve memory positions [0..ma-1].
-   * xs = x >> (ma*8) places x[63:ma*8] at bits [63-ma*8:0].
-   * m masks the top ma bytes to preserve from memory. */
-  uint64_t xs = x >> (8 * ma);
-  uint64_t m  = (ma == 0) ? 0ULL : (-(1ULL << (8 * (8 - ma))));
-  uint64_t merged = (r & m) | xs;
-  s->mem.set<uint64_t>(ea, bswap<EL>(merged));
-  s->pc += 4;
-  HISTO(s, mipsInsn::SDL);
-}
-
-template <bool EL>
-void _sdr(uint32_t inst, state_t *s) {
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int32_t imm = (int32_t)(int16_t)(inst & 0xffff);
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::store);
-  if(s->tlb_fault) return;
-  uint32_t ma = ea & 7;
-  ea &= ~7u;
-  if(EL) ma = 7 - ma;
-  uint64_t r = bswap<EL>(s->mem.get<uint64_t>(ea));
-  uint64_t x = s->gpr[rt];
-  /* SDR: store x's low (ma+1) bytes at memory positions [0..ma];
-   * preserve memory positions [ma+1..7].
-   * Shift x left by (7-ma)*8 to align x's low bytes to the high positions.
-   * rm masks the low bytes to preserve from memory. */
-  uint32_t xs_bits = 8 * (7 - ma);
-  uint64_t rm = (xs_bits == 0) ? 0ULL : ((1ULL << xs_bits) - 1);
-  uint64_t merged = (x << xs_bits) | (rm & r);
-  s->mem.set<uint64_t>(ea, bswap<EL>(merged));
-  s->pc += 4;
-  HISTO(s, mipsInsn::SDR);
-}
-
-static inline char* get_open_string(sparse_mem &mem, uint32_t offset) {
-  /* read byte-by-byte: the string may span pages, and the wasm backing is paged
-   * so a single get_raw_ptr is only valid within one 4 KiB page. */
-  size_t len = 0;
-  while(*mem.peek_raw_ptr(offset + len) != '\0') {
-    len++;
-  }
-  char *buf = new char[len+1];
-  for(size_t i = 0; i < len; i++) {
-    buf[i] = (char)*mem.peek_raw_ptr(offset + i);
-  }
-  buf[len] = '\0';
-  return buf;
-}
-
-
-
-template <bool EL>
-void _ldc1(uint32_t inst, state_t *s) {
-  uint32_t ft = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::load);
-  if(s->tlb_fault) return;
-  *reinterpret_cast<int64_t*>(s->cpr1 + fpr_dreg(s, ft)) = bswap<EL>(s->mem.get<int64_t>(ea));
-  s->pc += 4;
-  HISTO(s, mipsInsn::LDC1);
-}
-
-template <bool EL>
-void _sdc1(uint32_t inst, state_t *s) {
-  uint32_t ft = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::store);
-  if(s->tlb_fault) return;
-  s->mem.set<int64_t>(ea,  bswap<EL>((*(int64_t*)(s->cpr1 + fpr_dreg(s, ft)))));
-  s->pc += 4;
-  HISTO(s, mipsInsn::SDC1);  
-}
-
-template <bool EL>
-void _lwc1(uint32_t inst, state_t *s) {
-  uint32_t ft = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::load);
-  if(s->tlb_fault) return;
-  uint32_t v = bswap<EL>(s->mem.get<uint32_t>(ea)); 
-  *reinterpret_cast<float*>(fpr_hw(s, ft)) = *((float*)&v);
-  s->pc += 4;
-  HISTO(s, mipsInsn::LWC1);
-}
-
-template <bool EL>
-void _swc1(uint32_t inst, state_t *s) {
-  uint32_t ft = (inst >> 16) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = (int32_t)himm;
-  uint32_t ea = va_translate(s, s->gpr[rs] + imm, tlb_op::store);
-  if(s->tlb_fault) return;
-  uint32_t v = *fpr_hw(s, ft);
-  s->mem.set<uint32_t>(ea, bswap<EL>(v));
-  s->pc += 4;
-  HISTO(s, mipsInsn::SWC1);
-}
-
-/* FCSR.RM (bits[1:0]) -> C fenv rounding mode (for cvt.w / cvt.l). */
-static inline int fcsr_fe_round(state_t *s) {
-  switch(s->fcr1[CP1_CR31] & 3u) {
-  case 0:  return FE_TONEAREST;   /* RN */
-  case 1:  return FE_TOWARDZERO;  /* RZ */
-  case 2:  return FE_UPWARD;      /* RP */
-  default: return FE_DOWNWARD;    /* RM */
-  }
-}
-
-/* FP -> integer convert with an explicit rounding mode.  Covers round.*(RN),
- * ceil.*(+inf), floor.*(-inf) and cvt.*(FCSR.RM); trunc.* keeps its own path.
- * is_long => 64-bit fixed result (.l), else 32-bit (.w).  Mirrors r9999 fpu_f2i. */
-static void _fp2int(uint32_t inst, state_t *s, bool is_long, int fe_round) {
-  uint32_t fmt = (inst >> 21) & 31;
-  uint32_t fd  = (inst >> 6)  & 31;
-  uint32_t fs  = (inst >> 11) & 31;
-  double v;
-  switch(fmt) {
-  case FMT_S: v = (double)(*((float*)(s->cpr1 + fs)));  break;
-  case FMT_D: v =         (*((double*)(s->cpr1 + fs))); break;
-  default:
-    printf("%s: unhandled fmt=%u inst=%08x pc=%08x\n", __func__, fmt, inst, (uint32_t)s->pc);
-    exit(-1);
-  }
-  int save = std::fegetround();
-  std::fesetround(fe_round);
-  double r = std::nearbyint(v);
-  std::fesetround(save);
-  if(is_long) {
-    *((int64_t*)(s->cpr1 + fd)) = (int64_t)r;
-    s->cpr1_state[fd] = fp_reg_state::dp;
-  }
-  else {
-    *((int32_t*)(s->cpr1 + fd)) = (int32_t)r;
-    if(currFpMode != fpMode::mips3) { s->cpr1[fd + 1] = 0; }
-  }
-  {
-    static const bool g_fpall = getenv("FPALLLOG") != nullptr;
-    if(g_fpall && globals::asidpc_armed && (uint32_t)s->pc < 0x80000000u)
-      fprintf(stderr, "[fp] f2int long=%d v=%.17g r=%.17g -> 0x%016llx pc=%08x\n", (int)is_long, v, r,
-              (unsigned long long)*((uint64_t*)(s->cpr1+fd)), (uint32_t)s->pc);
-  }
-  s->pc += 4;
-}
-
-static void _truncl(uint32_t inst, state_t *s) {
-  uint32_t fmt = (inst >> 21) & 31;
-  uint32_t fd = (inst>>6) & 31;
-  uint32_t fs = (inst>>11) & 31;
-  int64_t *ptr = ((int64_t*)(s->cpr1 + fd));   /* trunc.l: 64-bit fixed result */
-  switch(fmt)
-    {
-    case FMT_S:
-      *ptr = (int64_t)(*((float*)(s->cpr1 + fs)));
-      break;
-    case FMT_D:
-      *ptr = (int64_t)(*((double*)(s->cpr1 + fs)));
-      break;
-    default:
-      printf("%s @ %d: unhandled fmt=%u inst=%08x pc=%08x\n", __func__, __LINE__, fmt, inst, (uint32_t)s->pc);
-      exit(-1);
-      break;
-    }
-  s->cpr1_state[fd] = fp_reg_state::dp;
-  {
-    static const bool g_fpall = getenv("FPALLLOG") != nullptr;
-    if(g_fpall && globals::asidpc_armed && (uint32_t)s->pc < 0x80000000u)
-      fprintf(stderr, "[fp] trunc.l fmt=%u -> 0x%016llx (%lld) pc=%08x\n", fmt,
-              (unsigned long long)*ptr, (long long)*ptr, (uint32_t)s->pc);
-  }
-  s->pc += 4;
-}
-
-static void _truncw(uint32_t inst, state_t *s) {
-  uint32_t fmt = (inst >> 21) & 31;
-  uint32_t fd = (inst>>6) & 31;
-  uint32_t fs = (inst>>11) & 31;
-  float f;
-  double d;
-  int32_t *ptr = ((int32_t*)(s->cpr1 + fd));
-  if(currFpMode != fpMode::mips3) {
-    assert((fd & 1) == 0);
-    assert((fs & 1) == 0);
-  }  
-  switch(fmt)
-    {
-    case FMT_S:
-      f = (*((float*)(s->cpr1 + fs)));
-      //printf("f=%g\n", f);
-      *ptr = (int32_t)f;
-      HISTO(s, mipsInsn::TRUNC_SP_W);
-      break;
-    case FMT_D:
-      d = (*((double*)(s->cpr1 + fs)));
-      *ptr = (int32_t)d;
-      HISTO(s, mipsInsn::TRUNC_DP_W);      
-      //printf("id=%d\n", *ptr);
-      break;
-    default:
-      printf("unknown trunc for fmt %d\n", fmt);
-      exit(-1);
-      break;
-    }
-  if(currFpMode != fpMode::mips3) {
-    s->cpr1[fd + 1] = 0;
-  }      
-  s->pc += 4;
-}
-
-static void _movnd(uint32_t inst, state_t *s) {
-  uint32_t fd = (inst>>6) & 31;
-  uint32_t fs = (inst>>11) & 31;
-  uint32_t rt = (inst>>16) & 31;
-  bool notZero = (s->gpr[rt] != 0);
-  s->cpr1[fd+0] = notZero ? s->cpr1[fs+0] : s->cpr1[fd+0];
-  if(currFpMode != fpMode::mips3)   /* FR=0 only: the double's high word is a separate reg */
-    s->cpr1[fd+1] = notZero ? s->cpr1[fs+1] : s->cpr1[fd+1];
-  s->pc += 4;
-}
-
-static void _movns(uint32_t inst, state_t *s) {
-  uint32_t fd = (inst>>6) & 31;
-  uint32_t fs = (inst>>11) & 31;
-  uint32_t rt = (inst>>16) & 31;
-  bool notZero = (s->gpr[rt] != 0);
-  s->cpr1[fd+0] = notZero ? s->cpr1[fs+0] : s->cpr1[fd+0];
-  s->pc += 4;
-}
-
-static void _movzd(uint32_t inst, state_t *s) {
-  uint32_t fd = (inst>>6) & 31;
-  uint32_t fs = (inst>>11) & 31;
-  uint32_t rt = (inst>>16) & 31;
- 
-  s->cpr1[fd+0] = (s->gpr[rt] == 0) ? s->cpr1[fs+0] : s->cpr1[fd+0];
-  if(currFpMode != fpMode::mips3)   /* FR=0 only: the double's high word is a separate reg */
-    s->cpr1[fd+1] = (s->gpr[rt] == 0) ? s->cpr1[fs+1] : s->cpr1[fd+1];
-  s->pc += 4;
-}
-
-static void _movzs(uint32_t inst, state_t *s) {
-  uint32_t fd = (inst>>6) & 31;
-  uint32_t fs = (inst>>11) & 31;
-  uint32_t rt = (inst>>16) & 31;
-
-  s->cpr1[fd+0] = (s->gpr[rt] == 0) ? s->cpr1[fs+0] : s->cpr1[fd+0];
-  s->pc += 4;
-}
-
-static void _movcd(uint32_t inst, state_t *s) {
-  uint32_t cc = (inst >> 18) & 7;
-  uint32_t fd = (inst>>6) & 31;
-  uint32_t fs = (inst>>11) & 31;
-  uint32_t tf = (inst>>16) & 1;
-
-  if(tf==0) {
-    if(getConditionCode(s,cc)==0) {
-      s->cpr1[fd+0] = s->cpr1[fs+0];
-      if(currFpMode != fpMode::mips3) s->cpr1[fd+1] = s->cpr1[fs+1];
-    }
-    HISTO(s, mipsInsn::FP_MOVF);
-  }
-  else {
-    if(getConditionCode(s,cc)==1) {
-      s->cpr1[fd+0] = s->cpr1[fs+0];
-      if(currFpMode != fpMode::mips3) s->cpr1[fd+1] = s->cpr1[fs+1];
-    }
-    HISTO(s, mipsInsn::FP_MOVT);
-  }
-  s->pc += 4;
-}
-
-static void _movcs(uint32_t inst, state_t *s) {
-  uint32_t cc = (inst >> 18) & 7;
-  uint32_t fd = (inst>>6) & 31;
-  uint32_t fs = (inst>>11) & 31;
-  uint32_t tf = (inst>>16) & 1;
-  if(tf==0) {
-    s->cpr1[fd+0] = getConditionCode(s, cc) ? s->cpr1[fd+0] : s->cpr1[fs+0];
-    HISTO(s, mipsInsn::FP_MOVF);
-  }
-  else {
-    s->cpr1[fd+0] = getConditionCode(s, cc) ? s->cpr1[fs+0] : s->cpr1[fd+0];
-    HISTO(s, mipsInsn::FP_MOVT);
-  }
-  s->pc += 4;
-}
-
-
-static void _movci(uint32_t inst, state_t *s) {
-  uint32_t cc = (inst >> 18) & 7;
-  uint32_t tf = (inst>>16) & 1;
-  uint32_t rd = (inst>>11) & 31;
-  uint32_t rs = (inst >> 21) & 31;
-  if(tf==0) {
-    /* movf */
-    s->gpr[rd] = getConditionCode(s, cc) ? s->gpr[rd] : s->gpr[rs];
-    HISTO(s, mipsInsn::MOVF);
-  }
-  else {
-    /* movt */
-    s->gpr[rd] = getConditionCode(s, cc) ? s->gpr[rs] : s->gpr[rd];
-    HISTO(s, mipsInsn::MOVT);    
-  }
-  s->pc += 4;
-}
-
-static void _cvts(uint32_t inst, state_t *s) {
-  uint32_t fmt = (inst >> 21) & 31;
-  uint32_t fd = (inst>>6) & 31;
-  uint32_t fs = (inst>>11) & 31;
-  if(currFpMode != fpMode::mips3) {
-    assert((fd & 1) == 0);
-    assert((fs & 1) == 0);
-  }
-  switch(fmt)
-    {
-    case FMT_D:
-      *((float*)(s->cpr1 + fd)) = (float)(*((double*)(s->cpr1 + fs)));
-      if(currFpMode != fpMode::mips3) {
-	s->cpr1[fd+1] = 0;
-      }
-      s->cpr1_state[fd] = fp_reg_state::sp;      
-      break;
-    case FMT_W:
-      *((float*)(s->cpr1 + fd)) = (float)(*((int32_t*)(s->cpr1 + fs)));
-      if(currFpMode != fpMode::mips3) {
-	*((float*)(s->cpr1 + fd + 1)) = 0;
-      }
-      break;
-    case FMT_L:    /* cvt.s.l: 64-bit fixed -> single */
-      *((float*)(s->cpr1 + fd)) = (float)(*((int64_t*)(s->cpr1 + fs)));
-      if(currFpMode != fpMode::mips3) {
-	*((float*)(s->cpr1 + fd + 1)) = 0;
-      }
-      break;
-    default:
-      printf("%s @ %d: unhandled fmt=%u inst=%08x pc=%08x\n", __func__, __LINE__, fmt, inst, (uint32_t)s->pc);
-      exit(-1);
-      break;
-    }
-  s->pc += 4;
-}
-
-static void _cvtd(uint32_t inst, state_t *s) {
-  uint32_t fmt = (inst >> 21) & 31;
-  uint32_t fd = (inst>>6) & 31;
-  uint32_t fs = (inst>>11) & 31;
-  switch(fmt)
-    {
-    case FMT_S:
-      *((double*)(s->cpr1 + fd)) = (double)(*((float*)(s->cpr1 + fs)));
-      s->cpr1_state[fd] = fp_reg_state::dp;
-      break;
-    case FMT_W:
-     *((double*)(s->cpr1 + fd)) = (double)(*((int32_t*)(s->cpr1 + fs)));
-      break;
-    case FMT_L:    /* cvt.d.l: 64-bit fixed -> double */
-      *((double*)(s->cpr1 + fd)) = (double)(*((int64_t*)(s->cpr1 + fs)));
-      s->cpr1_state[fd] = fp_reg_state::dp;
-      break;
-    default:
-      printf("%s @ %d: unhandled fmt=%u inst=%08x pc=%08x\n", __func__, __LINE__, fmt, inst, (uint32_t)s->pc);
-      exit(-1);
-      break;
-    }
-  {
-    static const bool g_fpall = getenv("FPALLLOG") != nullptr;
-    if(g_fpall && globals::asidpc_armed && (uint32_t)s->pc < 0x80000000u)
-      fprintf(stderr, "[fp] cvt.d fmt=%u fs=0x%016llx -> %.17g pc=%08x\n", fmt,
-              (unsigned long long)*((uint64_t*)(s->cpr1+fs)), *((double*)(s->cpr1+fd)), (uint32_t)s->pc);
-  }
-  s->pc += 4;
-}
-
-static void _fmovn(uint32_t inst, state_t *s) {
-  uint32_t fmt = (inst >> 21) & 31;
-  switch(fmt)
-    {
-    case FMT_S:
-      _movns(inst, s);
-      break;
-    case FMT_D:
-      _movnd(inst, s);
-      break;
-    default:
-      printf("unsupported %s\n", __func__);
-      exit(-1);
-      break;
-    }
-}
-
-
-static void _fmovz(uint32_t inst, state_t *s) {
-  uint32_t fmt = (inst >> 21) & 31;
-  switch(fmt)
-    {
-    case FMT_S:
-      _movzs(inst, s);
-      break;
-    case FMT_D:
-      _movzd(inst, s);
-      break;
-    default:
-      printf("unsupported %s\n", __func__);
-      exit(-1);
-      break;
-    }
-}
-
-static void _fmovc(uint32_t inst, state_t *s) {
-  uint32_t fmt = (inst >> 21) & 31;
-  switch(fmt)
-    {
-    case FMT_S:
-      _movcs(inst, s);
-      break;
-    case FMT_D:
-      _movcd(inst, s);
-      break;
-    default:
-      printf("unsupported %s\n", __func__);
-      exit(-1);
-      break;
-    }
-}
-
-
-
-template <typename T>
-static void fpCmp(uint32_t inst, state_t *s) {
-  uint32_t cond = inst & 15;
-  uint32_t cc = (inst >> 8) & 7;
-  uint32_t ft = (inst >> 16) & 31;
-  uint32_t fs = (inst >> 11) & 31;
-  T Tfs = *((T*)(s->cpr1+fs));
-  T Tft = *((T*)(s->cpr1+ft));
-  uint32_t v = 0;
-
-  switch(cond)
-    {
-    case COND_EQ:
-      v = (Tfs == Tft);
-      HISTO(s, select_fp_insn<T>(mipsInsn::DP_CMP_EQ, mipsInsn::SP_CMP_EQ));            
-      setConditionCode(s, v, cc);   /* FCSR bit 23/25.. is architectural; FCCR mirrors it */
-      break;
-    case COND_LT:
-      v = (Tfs < Tft);
-      HISTO(s, select_fp_insn<T>(mipsInsn::DP_CMP_LT, mipsInsn::SP_CMP_LT));      
-      setConditionCode(s, v, cc);   /* FCSR bit 23/25.. is architectural; FCCR mirrors it */
-      break;
-    case COND_LE:
-      v = (Tfs <= Tft);
-      HISTO(s, select_fp_insn<T>(mipsInsn::DP_CMP_LE, mipsInsn::SP_CMP_LE));            
-      setConditionCode(s, v, cc);   /* FCSR bit 23/25.. is architectural; FCCR mirrors it */
-      break;
-    default: {
-      /* the other conditions: cond[0] = true if unordered, cond[1] = if equal,
-       * cond[2] = if less than (cond[3] only selects signalling on QNaN, which
-       * raises no exception here) -- e.g. c.olt from IRIS GL code (fsn) */
-      const bool un = (Tfs != Tfs) || (Tft != Tft);
-      v = (((cond & 1) != 0) && un) || (((cond & 2) != 0) && !un && (Tfs == Tft)) ||
-          (((cond & 4) != 0) && !un && (Tfs < Tft));
-      setConditionCode(s, v, cc);
-      break;
-    }
-    }
-  if(globals::trace_retirement) {
-    std::cout << std::hex
-	      << s->pc
-	      << std::dec
-	      << " c. "
-	      << Tfs
-	      << " "
-	      << getCondName(cond)
-	      << " "
-	      << Tft
-	      << " = "
-	      << v
-	      << "\n";
-  }
-  {
-    static const bool g_fpall = getenv("FPALLLOG") != nullptr;
-    if(g_fpall && globals::asidpc_armed && (uint32_t)s->pc < 0x80000000u)
-      fprintf(stderr, "[fp] cmp cond=%u fs=%.17g ft=%.17g -> %u cc=%u pc=%08x\n",
-              cond, (double)Tfs, (double)Tft, v, cc, (uint32_t)s->pc);
-  }
-  s->pc += 4;
-}
-
-static void _c(uint32_t inst, state_t *s) {
-  uint32_t fmt = (inst >> 21) & 31;
-  switch(fmt)
-    {
-    case FMT_S:
-      fpCmp<float>(inst,s);
-      break;
-    case FMT_D:
-      fpCmp<double>(inst,s);
-      break;
-    default:
-      printf("unsupported comparison\n");
-      exit(-1);
-      break;
-    }
-}
-
-/* R4000 FP exceptions, matching the RTL fpu.sv: div/sqrt (+rsqrt/recip) are NOT
- * implemented in HW and ALWAYS raise Unimplemented-Op (E) -> OS soft-float; add/
- * sub/mul raise E on a denormal operand or a denormal (underflow) result.  The
- * interp must trap the SAME ops so the checkpoints/traces it produces (and the
- * cosim) stay consistent with the CU1/FPE-enforcing RTL. */
-template<typename T>
-static inline bool fp_is_denorm(T x) { return std::fpclassify(x) == FP_SUBNORMAL; }
-
-/* Legacy-MIPS QUIET NaN: exponent all ones, nonzero significand, significand
- * MSB CLEAR (the quiet bit is inverted vs IEEE 754-2008, so MSB SET = signaling).
- * The R4400 manual lists "Quiet Not a Number operand, except for Compare" among
- * the conditions that signal Unimplemented (E); MAME's r4000.cpp implements it,
- * we historically did not.  FP_QNAN_TRAP turns it on for A/B testing. */
-template<typename T> static inline bool fp_is_qnan(T x);
-template<> inline bool fp_is_qnan<double>(double x) {
-  uint64_t u; std::memcpy(&u, &x, 8);
-  return ((u & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL) &&
-         ((u & 0x000fffffffffffffULL) != 0) &&
-         ((u & 0x0008000000000000ULL) == 0);
-}
-template<> inline bool fp_is_qnan<float>(float x) {
-  uint32_t u; std::memcpy(&u, &x, 4);
-  return ((u & 0x7f800000u) == 0x7f800000u) &&
-         ((u & 0x007fffffu) != 0) &&
-         ((u & 0x00400000u) == 0);
-}
-
-/* FPTRAPCOUNT: how often does an FP op actually trap to the OS emulator, and why?
- * With uni_divider the only remaining traps are denormal operand / underflowing
- * result, so this answers directly -- rather than by PC sampling -- whether the
- * IRIX soft-float emulator is reachable at all in a given workload. */
-static uint64_t g_fptrap[8];
-static const char *g_fptrap_name[8] =
-  { "add", "sub", "mul", "div", "sqrt", "rsqrt", "recip", "other" };
-struct fptrap_report_t {
-  ~fptrap_report_t() {
-    if(!getenv("FPTRAPCOUNT")) {
-      return;
-    }
-    uint64_t tot = 0;
-    for(int i = 0; i < 8; i++) {
-      tot += g_fptrap[i];
-    }
-    fprintf(stderr, "[fptrap] total=%llu", (unsigned long long)tot);
-    for(int i = 0; i < 8; i++) {
-      if(g_fptrap[i]) {
-        fprintf(stderr, " %s=%llu", g_fptrap_name[i], (unsigned long long)g_fptrap[i]);
-      }
-    }
-    fprintf(stderr, "\n");
-  }
-};
-static fptrap_report_t g_fptrap_report;
-
-template<typename T, fpOperation op>
-static inline bool fp_e_trap(T fs, T ft) {
-  /* FP_DIVTRAP models the PRE-uni_divider machine (fpu.sv raised E for every
-   * div/sqrt -> OS soft-float).  The current RTL does div/sqrt in HW and traps
-   * only on a denormal operand or an underflowing result, matching
-   * uni_divider.sv's w_in_denorm / w_denorm.  rsqrt/recip are MIPS IV and are
-   * still not implemented in HW (fpu.sv FP_UNIMPL -> always E). */
-  static const bool g_divtrap = getenv("FP_DIVTRAP") != nullptr;
-  static const bool g_qnantrap = getenv("FP_QNAN_TRAP") != nullptr;
-  /* FP_HW_DENORM: compute denormals in "hardware" (SoftFloat handles them
-   * correctly) instead of raising E and letting the OS emulator do it.  This is
-   * what QEMU and IRIS do; it is NOT R4400-conformant (the manual traps on a
-   * denormal operand unconditionally), but it is the knob that tests whether the
-   * emulator excursion itself is what corrupts these benchmarks. */
-  static const bool g_hwden = getenv("FP_HW_DENORM") != nullptr;
-  if(g_qnantrap) {
-    /* ft is only an operand for the two-source ops; sqrt/rsqrt/recip read fs only
-     * and would otherwise trap on whatever happens to sit in the ft field. */
-    bool two_src = (op == fpOperation::add) || (op == fpOperation::sub) ||
-                   (op == fpOperation::mul) || (op == fpOperation::div);
-    if(fp_is_qnan(fs) || (two_src && fp_is_qnan(ft))) {
-      return true;
-    }
-  }
-  switch(op) {
-  case fpOperation::rsqrt: case fpOperation::recip:
-    return !globals::cpu_r5000;                   /* fpu.sv FP_UNIMPL: always E; HW on the R5000 */
-  case fpOperation::div:
-    return g_divtrap || (!g_hwden && (fp_is_denorm(fs)||fp_is_denorm(ft)||fp_is_denorm((T)(fs/ft))));
-  case fpOperation::sqrt:
-    return g_divtrap || (!g_hwden && (fp_is_denorm(fs)||fp_is_denorm((T)std::sqrt((double)fs))));
-  case fpOperation::add: return !g_hwden && (fp_is_denorm(fs)||fp_is_denorm(ft)||fp_is_denorm((T)(fs+ft)));
-  case fpOperation::sub: return !g_hwden && (fp_is_denorm(fs)||fp_is_denorm(ft)||fp_is_denorm((T)(fs-ft)));
-  case fpOperation::mul: return !g_hwden && (fp_is_denorm(fs)||fp_is_denorm(ft)||fp_is_denorm((T)(fs*ft)));
-  default: return false;                          /* abs/neg/mov: no E */
-  }
-}
-
-
-/* ---- FP_COSIM: per-op SoftFloat-vs-host differential -------------------
- * Runs BOTH implementations on every arithmetic op but KEEPS the SoftFloat
- * result, so the instruction stream is bit-identical to a normal run and the
- * comparison is not confounded by divergent control flow (the mistake the
- * FP_NATIVE arm made -- it ignores FCSR.RM, so every benchmark took different
- * branches and nothing could be concluded).
- * Only compared when FCSR.RM == 0 (round-to-nearest); the host rounding mode is
- * not steered, so any other RM is counted and skipped rather than reported as a
- * divergence.  NaN-vs-NaN is a payload difference (x86 vs MIPS-legacy) and is
- * counted separately.  Anything left is a REAL arithmetic divergence. */
-static uint64_t g_cos_cmp, g_cos_skip_rm, g_cos_nan, g_cos_real;
-
-template<typename T>
-static inline uint64_t fp_bits(T v) {
-  if(sizeof(T) == 8) { uint64_t u; std::memcpy(&u, &v, 8); return u; }
-  uint32_t u; std::memcpy(&u, &v, 4); return (uint64_t)u;
-}
-
-template<typename T, fpOperation op>
-static inline void fp_cosim_check(state_t *s, T fs, T ft, T got) {
-  T nat;
-  switch(op) {
-  case fpOperation::add:  nat = fs + ft; break;
-  case fpOperation::sub:  nat = fs - ft; break;
-  case fpOperation::mul:  nat = fs * ft; break;
-  case fpOperation::div:  nat = fs / ft; break;
-  case fpOperation::sqrt: nat = (T)__builtin_sqrt((double)fs); break;
-  default: return;
-  }
-  if((s->fcr1[CP1_CR31] & 3u) != 0u) {
-    g_cos_skip_rm++;
-    return;
-  }
-  g_cos_cmp++;
-  /* FP_COSIM_INJECT=<n>: corrupt the n'th compared result so the REAL-divergence
-   * branch is exercised.  Without this the NaN-payload path is the only one the
-   * smoke test covers, and a broken classifier would look like a clean run. */
-  static const uint64_t g_inj = getenv("FP_COSIM_INJECT") ? strtoull(getenv("FP_COSIM_INJECT"),0,0) : 0;
-  if(g_inj && g_cos_cmp == g_inj) {
-    uint64_t b = fp_bits(got) ^ 1ULL;
-    std::memcpy(&got, &b, sizeof(T));
-  }
-  if(fp_bits(nat) == fp_bits(got)) {
-    return;
-  }
-  if((nat != nat) && (got != got)) {   /* both NaN: payload convention only */
-    g_cos_nan++;
-    return;
-  }
-  g_cos_real++;
-  if(g_cos_real <= 40) {
-    fprintf(stderr, "[cosim] REAL DIVERGENCE op=%d sz=%zu icnt=%llu pc=%08x\n",
-            (int)op, sizeof(T), (unsigned long long)s->icnt, (uint32_t)s->pc);
-    fprintf(stderr, "[cosim]   fs=%016llx ft=%016llx  softfloat=%016llx host=%016llx\n",
-            (unsigned long long)fp_bits(fs), (unsigned long long)fp_bits(ft),
-            (unsigned long long)fp_bits(got), (unsigned long long)fp_bits(nat));
-    fprintf(stderr, "[cosim]   %.17g op %.17g -> sf %.17g / host %.17g\n",
-            (double)fs, (double)ft, (double)got, (double)nat);
-  }
-}
-
-struct cosim_report_t {
-  ~cosim_report_t() {
-    if(!getenv("FP_COSIM")) { return; }
-    fprintf(stderr, "[cosim] compared=%llu real_divergences=%llu nan_payload=%llu skipped_rm=%llu\n",
-            (unsigned long long)g_cos_cmp, (unsigned long long)g_cos_real,
-            (unsigned long long)g_cos_nan, (unsigned long long)g_cos_skip_rm);
-  }
-};
-static cosim_report_t g_cosim_report;
-
-template< typename T, fpOperation op>
-static void execFP(uint32_t inst, state_t *s) {
-  uint32_t ft = (inst>>16)&31, fs=(inst>>11)&31, fd=(inst>>6)&31;
-  T _fs = *reinterpret_cast<T*>(s->cpr1+fs);
-  T _ft = *reinterpret_cast<T*>(s->cpr1+ft);
-  T &_fd = *reinterpret_cast<T*>(s->cpr1+fd);
-
-  /* Fault BEFORE committing fd (op faults at retirement, EPC = this op; the OS
-   * emulator re-executes it), matching the RTL. */
-  {
-    bool want_trap = fp_e_trap<T,op>(_fs, _ft);
-    /* DIAGNOSTIC: FP_NODIVTRAP executes div/sqrt in host FP instead of trapping to
-     * the OS soft-float emulator -- isolates emulator bugs from the interp's own FP. */
-    static const bool g_nodivtrap = getenv("FP_NODIVTRAP") != nullptr;
-    if(want_trap && g_nodivtrap &&
-       (op == fpOperation::div || op == fpOperation::sqrt ||
-        op == fpOperation::rsqrt || op == fpOperation::recip)) {
-      want_trap = false;
-    }
-    if(want_trap) {
+  if(asi == 0x4) {
+    switch(va & 0xf00)
       {
-        int slot = (op == fpOperation::add) ? 0 : (op == fpOperation::sub) ? 1
-                 : (op == fpOperation::mul) ? 2 : (op == fpOperation::div) ? 3
-                 : (op == fpOperation::sqrt) ? 4 : (op == fpOperation::rsqrt) ? 5
-                 : (op == fpOperation::recip) ? 6 : 7;
-        g_fptrap[slot]++;
+      case 0x000: return s->mmu_ctrl;
+      case 0x100: return s->mmu_ctpr;
+      case 0x200: return s->mmu_ctx;
+      case 0x300: {           /* reading the fault status clears it */
+	uint32_t v = s->mmu_fsr;
+	s->mmu_fsr = 0;
+	return v;
       }
-      static const bool g_fpelog = getenv("FPELOG") != nullptr;
-      if(g_fpelog) {
-        fprintf(stderr, "[fpe] op=%d sz=%zu fs=%.17g ft=%.17g epc=%08x icnt=%llu\n",
-                (int)op, sizeof(T), (double)_fs, (double)_ft,
-                (uint32_t)s->pc, (unsigned long long)s->icnt);
-      }
-      take_exception_fpe(s); return;
-    }
-  }
-
-  /* Arithmetic goes through SoftFloat with the FCSR rounding mode applied, so
-   * add/sub/mul/div/sqrt round exactly like a real R4000 FPU (and the RTL).
-   * abs/neg/mov are exact bit ops -- host is fine. */
-  sf_set_rm(s);
-
-  switch(op)
-    {
-    case fpOperation::abs:
-      _fd = std::abs(_fs);
-      HISTO(s, select_fp_insn<T>(mipsInsn::DP_ABS, mipsInsn::SP_ABS));
-      break;
-    case fpOperation::neg:
-      _fd = -_fs;
-      HISTO(s, select_fp_insn<T>(mipsInsn::DP_NEG, mipsInsn::SP_NEG));
-      break;
-    case fpOperation::mov:
-      _fd = _fs;
-      HISTO(s, select_fp_insn<T>(mipsInsn::DP_MOV, mipsInsn::SP_MOV));            
-      break;
-    case fpOperation::add:
-      _fd = sf_add(_fs, _ft);
-      HISTO(s, select_fp_insn<T>(mipsInsn::DP_ADD, mipsInsn::SP_ADD));
-      break;
-    case fpOperation::sub:
-      _fd = sf_sub(_fs, _ft);
-      HISTO(s, select_fp_insn<T>(mipsInsn::DP_SUB, mipsInsn::SP_SUB));
-      break;
-    case fpOperation::mul:
-      _fd = sf_mul(_fs, _ft);
-      HISTO(s, select_fp_insn<T>(mipsInsn::DP_MUL, mipsInsn::SP_MUL));
-      break;
-    case fpOperation::div:
-      /* SoftFloat already gives IEEE semantics for a zero divisor: x/0 -> +-Inf
-       * with DivideByZero, 0/0 -> NaN with Invalid.  (This used to return
-       * DBL_MAX, which was wrong; it was unreachable while div ALWAYS trapped,
-       * but uni_divider does div in HW so this path is now live.) */
-      _fd = sf_div(_fs, _ft);
-      HISTO(s, select_fp_insn<T>(mipsInsn::DP_DIV, mipsInsn::SP_DIV));
-      break;
-    case fpOperation::sqrt:
-      _fd = sf_sqrtf(_fs);
-      HISTO(s, select_fp_insn<T>(mipsInsn::DP_SQRT, mipsInsn::SP_SQRT));
-      break;
-    case fpOperation::rsqrt:
-      _fd = sf_div(static_cast<T>(1.0), sf_sqrtf(_fs));
-      HISTO(s, select_fp_insn<T>(mipsInsn::DP_RSQRT, mipsInsn::SP_RSQRT));
-      break;
-    case fpOperation::recip:
-      _fd = sf_div(static_cast<T>(1.0), _fs);
-      HISTO(s, select_fp_insn<T>(mipsInsn::DP_RECIP, mipsInsn::SP_RECIP));
-      break;
-    default:
-      UNREACHABLE();
-    }
-  {
-    static const bool g_cosim = getenv("FP_COSIM") != nullptr;
-    if(g_cosim) {
-      fp_cosim_check<T,op>(s, _fs, _ft, _fd);
-    }
-  }
-  {
-    static const bool g_fpall = getenv("FPALLLOG") != nullptr;
-    if(g_fpall && globals::asidpc_armed && (uint32_t)s->pc < 0x80000000u)
-      fprintf(stderr, "[fp] arith op=%d sz=%zu fs=%.17g ft=%.17g -> %.17g RM=%u pc=%08x\n",
-              (int)op, sizeof(T), (double)_fs, (double)_ft, (double)_fd,
-              (unsigned)(s->fcr1[CP1_CR31] & 3u), (uint32_t)s->pc);
-  }
-  s->pc+=4;
-}
-
-template <fpOperation op>
-void do_fp_op(uint32_t inst, state_t *s) {
-  int fd=(inst>>6)&31;
-  switch((inst>>21)&31) {
-  case FMT_S:
-    execFP<float,op>(inst,s);
-    s->cpr1_state[fd] = fp_reg_state::sp;
-    if(currFpMode != fpMode::mips3) {   /* FR=0 pairing: even-only, scrub the high reg */
-      assert((fd&1) == 0);
-      s->cpr1[fd+1] = 0;
-      s->cpr1_state[fd+1] = fp_reg_state::unknown;
-    }
-    break;
-  case FMT_D:
-    execFP<double,op>(inst,s);
-    s->cpr1_state[fd] = fp_reg_state::dp;
-    break;
-  default:
-    UNREACHABLE();
-  }
-}
-
-
-template <bool EL>
-static void execCoproc1(uint32_t inst, state_t *s) {
-  uint32_t opcode = inst>>26;
-  uint32_t functField = (inst>>21) & 31;
-  uint32_t lowop = inst & 63;  
-  uint32_t fmt = (inst >> 21) & 31;
-  uint32_t nd_tf = (inst>>16) & 3;
-  
-  uint32_t lowbits = inst & ((1<<11)-1);
-  opcode &= 0x3;
-
-  if(fmt == 0x8)
-    {
-      switch(nd_tf)
-	{
-	case 0x0:
-	  branch<EL,branch_type::bc1f>(inst, s);
-	  break;
-	case 0x1:
-	  branch<EL,branch_type::bc1t>(inst, s);
-	  break;
-	case 0x2:
-	  branch<EL,branch_type::bc1fl>(inst, s);
-	  break;
-	case 0x3:
-	  branch<EL,branch_type::bc1tl>(inst, s);
-	  break;
-	}
-      /*BRANCH*/
-    }
-  else if((lowbits == 0) && ((functField==0x0) || (functField==0x4) ||
-			     (functField==0x2) || (functField==0x6) ||
-			     (functField==0x1) || (functField==0x5)))
-    {
-      if(functField == 0x0)
-	{
-	  /* move from coprocessor */
-	  _mfc1(inst,s);
-	}
-      else if(functField == 0x4)
-	{
-	  /* move to coprocessor */
-	  _mtc1(inst,s);
-	}
-      else if(functField == 0x1)
-	{
-	  /* doubleword move from coprocessor (dmfc1) */
-	  _dmfc1(inst,s);
-	}
-      else if(functField == 0x5)
-	{
-	  /* doubleword move to coprocessor (dmtc1) */
-	  _dmtc1(inst,s);
-	}
-      else if(functField == 0x2)
-	{
-	  /* move from control coprocessor (cfc1) */
-	  _cfc1(inst,s);
-	}
-      else if(functField == 0x6)
-	{
-	  /* move to control coprocessor (ctc1) */
-	  _ctc1(inst,s);
-	}
-    }
-  else
-    {
-      if((lowop >> 4) == 3)
-	{
-	  _c(inst, s);
-	}
-      else{
-	switch(lowop)
-	  {
-	  case 0x0:
-	    do_fp_op<fpOperation::add>(inst, s);
-	    break;
-	  case 0x1:
-	    do_fp_op<fpOperation::sub>(inst, s);
-	    break;
-	  case 0x2:
-	    do_fp_op<fpOperation::mul>(inst, s);
-	    break;
-	  case 0x3:
-	    do_fp_op<fpOperation::div>(inst, s);
-	    break;
-	  case 0x4:
-	    do_fp_op<fpOperation::sqrt>(inst, s);
-	    break;
-	  case 0x5:
-	    do_fp_op<fpOperation::abs>(inst, s);
-	    break;
-	  case 0x6:
-	    do_fp_op<fpOperation::mov>(inst, s);
-	    break;
-	  case 0x7:
-	    do_fp_op<fpOperation::neg>(inst, s);
-	    break;
-	  case 0x8:   /* round.l -> RN */
-	    _fp2int(inst, s, true,  FE_TONEAREST);
-	    break;
-	  case 0x9:
-	    _truncl(inst, s);
-	    break;
-	  case 0xa:   /* ceil.l  -> +inf */
-	    _fp2int(inst, s, true,  FE_UPWARD);
-	    break;
-	  case 0xb:   /* floor.l -> -inf */
-	    _fp2int(inst, s, true,  FE_DOWNWARD);
-	    break;
-	  case 0xc:   /* round.w -> RN */
-	    _fp2int(inst, s, false, FE_TONEAREST);
-	    break;
-	  case 0xd:
-	    _truncw(inst, s);
-	    break;
-	  case 0xe:   /* ceil.w  -> +inf */
-	    _fp2int(inst, s, false, FE_UPWARD);
-	    break;
-	  case 0xf:   /* floor.w -> -inf */
-	    _fp2int(inst, s, false, FE_DOWNWARD);
-	    break;
-	  case 0x11:
-	    if(!globals::cpu_r5000) {
-	      take_exception_fpe(s);   /* MIPS IV: Unimplemented Operation on the R4400 */
-	      break;
-	    }
-	    _fmovc(inst, s);
-	    break;
-	  case 0x12:
-	    if(!globals::cpu_r5000) {
-	      take_exception_fpe(s);
-	      break;
-	    }
-	    _fmovz(inst, s);
-	    break;
-	  case 0x13:
-	    if(!globals::cpu_r5000) {
-	      take_exception_fpe(s);
-	      break;
-	    }
-	    _fmovn(inst, s);
-	    break;
-	  case 0x15:
-	    do_fp_op<fpOperation::recip>(inst, s);
-	    break;
-	  case 0x16:
-	    do_fp_op<fpOperation::rsqrt>(inst, s);
-	    break;
-	  case 0x20:
-	    /* cvt.s */
-	    _cvts(inst, s);
-	    break;
-	  case 0x21:
-	    _cvtd(inst, s);
-	    break;
-	  case 0x24:  /* cvt.w -> FCSR.RM */
-	    _fp2int(inst, s, false, fcsr_fe_round(s));
-	    break;
-	  case 0x25:  /* cvt.l -> FCSR.RM */
-	    _fp2int(inst, s, true,  fcsr_fe_round(s));
-	    break;
-	  default:
-	    printf("unhandled coproc1 instruction (%x) @ %08x : %s\n",
-		   inst, s->pc, getAsmString(inst, s->pc).c_str());
-	    take_exception_ri(s);	    
-	    break;
-	  }
-      }
-    }
-}
-
-template <bool EL>
-bool is_store_insn(state_t *s) {
-  sparse_mem &mem = s->mem;
-  uint32_t inst = bswap<EL>(mem.get<uint32_t>(va2pa(s->pc)));
-  uint32_t opcode = inst>>26;
-  switch(opcode)
-    {
-    case 0x28: //_sb(inst, s); 
-    case 0x29: //_sh<EL>(inst, s); 
-    case 0x2a: //_swl<EL>(inst, s); 
-    case 0x2B: //_sw<EL>(inst, s); 
-    case 0x2e: //_swr<EL>(inst, s);
-    case 0x39: //_swc1<EL>(inst, s);
-    case 0x38: //_sc
-    case 0x3D: //_sdc1<EL>(inst, s);
-      return true;
-    default:
-      break;
-    }
-  return false;
-}
-
-
-bool is_store_insn(state_t *s) {
-  return is_store_insn<false>(s);
-}
-
-
-/* ---- decoded-instruction cache ----------------------------------------------------
- * One lazily allocated page of slots per 4 KB physical page that has executed code,
- * {handler, raw word}.  The fetch path still loads the raw word and re-decodes on a
- * mismatch, so self-modifying code, DMA into code pages and PROM shadowing need no
- * invalidation. */
-typedef void (*dinst_fn_t)(uint32_t inst, state_t *s);
-struct dinst_t {
-  dinst_fn_t fn;
-  uint32_t inst;
-};
-static const uint32_t DPAGE_SLOTS = 1024;
-static dinst_t *g_dpages[1u << 20];   /* by 4 KB physical page number (32-bit PA) */
-static dinst_t *g_fc_dpage = nullptr; /* decoded page for the fetch cache's page */
-static uint8_t *g_fc_host = nullptr;   /* host bytes of that page, or null: fetch via mem.get */
-
-uint8_t g_code_page[1u << 20];          /* see sparse_mem.hh: page has decoded slots */
-static uint64_t g_code_wipes = 0;        /* pages wiped by a write (reported at exit) */
-
-/* decoded pages are keyed like the write checks: the MC-aliased physical page */
-static inline uint32_t dpage_key(uint32_t pa) {
-  return (uint32_t)(sparse_mem::mc_alias(pa) >> 12) & 0xfffffu;
-}
-
-static dinst_t *dpage_for(uint32_t pa) {
-  dinst_t *&d = g_dpages[dpage_key(pa)];
-  if(d == nullptr) {
-    d = new dinst_t[DPAGE_SLOTS]();
-  }
-  return d;
-}
-
-/* a write hit a page holding decoded instructions: forget them (the page stays
- * allocated, so the fetch cache's pointer stays valid; the next fetch re-decodes) */
-void code_page_written(uint32_t ppn) {
-  dinst_t *d = g_dpages[ppn];
-  if(d != nullptr) {
-    memset(d, 0, DPAGE_SLOTS * sizeof(dinst_t));
-  }
-  g_code_page[ppn] = 0;
-  g_code_wipes++;
-}
-
-void report_decode_cache() {
-  uint64_t pages = 0;
-  for(uint32_t i = 0; i < (1u << 20); i++) {
-    pages += (g_dpages[i] != nullptr);
-  }
-  fprintf(stderr, "[predecode] %llu decoded pages, %llu wiped by writes\n",
-          (unsigned long long)pages, (unsigned long long)g_code_wipes);
-}
-
-/* Everything after fetch: the dynamic checks (64-bit gating, MIPS IV RI, CU1) and the
- * full dispatch.  The decoded-instruction cache's default handler (see decode_insn).
- */
-template <bool EL>
-static void exec_generic(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem;
-  (void)mem;
-  uint32_t opcode = inst>>26;
-  bool isRType = (opcode==0);
-  bool isJType = ((opcode>>1)==1);
-  bool isCoproc0 = (opcode == 0x10);
-  bool isCoproc1 = (opcode == 0x11);
-  bool isCoproc1x = (opcode == 0x13);
-  bool isCoproc2 = (opcode == 0x12);
-  bool isSpecial2 = (opcode == 0x1c); 
-  bool isSpecial3 = (opcode == 0x1f);
-  bool isLoadLinked = (opcode == 0x30);
-  bool isStoreCond = (opcode == 0x38);
-  bool isLoadLinkedD = (opcode == 0x34);   /* lld */
-  bool isStoreCondD = (opcode == 0x3c);    /* scd */
-  uint32_t rs = (inst >> 21) & 31;
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rd = (inst >> 11) & 31;
-  /* 64-bit ops raise Reserved Instruction when not in 64-bit mode (matches the
-   * RTL decode_mips.sv gate; the random instruction tests rely on this). */
-  if(is_64b_gated(inst) && !in_64b_mode(s)) {
-    take_exception_ri(s);
-    return;
-  }
-
-  /* MIPS IV integer ops (movf/movt, movz/movn) and the whole COP1X opcode are
-   * reserved on the R4400 (MIPS III) and in r9999's decode: RI unless --cpu r5000.
-   * pref (0x33) stays a no-op on both, matching decode_mips.sv. */
-  if(!globals::cpu_r5000) {
-    uint32_t op = inst >> 26, fn = inst & 0x3fu;
-    if((op == 0x13) || ((op == 0) && (fn == 0x01 || fn == 0x0a || fn == 0x0b))) {
-      raise_ri(s, inst);
-      return;
-    }
-  }
-
-  /* CP1 Coprocessor-Unusable: a CP1/FP op with Status.CU1==0 raises CpU (CE=1),
-   * mirroring the RTL decode_mips.sv gate and the henny cosim ISS.  Gated opcodes:
-   * COP1 (0x11, incl mfc1/mtc1/cfc1/ctc1), LWC1 (0x31), LDC1 (0x35), SWC1 (0x39),
-   * SDC1 (0x3d).  IRIX lazy-FPU: o32 processes run CU1=0 and take this trap on first
-   * FP use.  Previously interp_mips ignored CU1, building FP bookkeeping inconsistent
-   * with CU1-enforcing HW -- which derailed checkpoint resume onto the RTL. */
-  { uint32_t op = inst >> 26;
-    if((op == 0x11 || op == 0x13 || op == 0x31 || op == 0x35 || op == 0x39 || op == 0x3d)
-       && !(s->cpr0[CPR0_SR] & SR_CU1)) {
-      take_exception_cpu(s, 1);
-      return;
-    }
-  }
-    
-  if(isRType) {
-    uint32_t funct = inst & 63;
-    uint32_t sa = (inst >> 6) & 31;
-    switch(funct) 
-      {
-      case 0x00: /*sll*/
-	s->gpr[rd] = static_cast<int32_t>(s->gpr[rt]) << sa;
-	s->pc += 4;
-	if(inst == 0) {
-	  HISTO(s, mipsInsn::NOP);
-	}
-	else {
-	  HISTO(s, mipsInsn::SLL);
-	}
-	break;
-      case 0x01: /* movci */
-	_movci(inst,s);
-	break;
-      case 0x02: /* srl */
-	s->gpr[rd] = sext64(((uint32_t)s->gpr[rt] >> sa));
-	s->pc += 4;
-	HISTO(s, mipsInsn::SRL);
-	break;
-      case 0x03: /* sra */
-	s->gpr[rd] = static_cast<int32_t>(s->gpr[rt]) >> sa;
-	s->pc += 4;
-	HISTO(s, mipsInsn::SRA);
-	break;	
-      case 0x04: /* sllv */
-	s->gpr[rd] = sext64(static_cast<uint32_t>(s->gpr[rt]) << (s->gpr[rs] & 0x1f));
-	s->pc += 4;
-	HISTO(s, mipsInsn::SLLV);
-	break;
-      case 0x06:  /* srlv: sign-extend the 32-bit logical-shift result (MIPS64) */
-	s->gpr[rd] = sext64((uint32_t)s->gpr[rt] >> (s->gpr[rs] & 0x1f));
-	s->pc += 4;
-	HISTO(s, mipsInsn::SRLV);
-	break;
-      case 0x07:  /* srav: 32-bit arithmetic shift, result sign-extended (MIPS64) */
-	s->gpr[rd] = static_cast<int32_t>(s->gpr[rt]) >> (s->gpr[rs] & 0x1f);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SRAV);
-	break;
-      case 0x08: { /* jr */
-	state_t::reg_t jaddr = s->gpr[rs];
-	s->pc += 4;
-	if(!run_delay_slot<EL>(s))
-	  s->pc = jaddr;
-	HISTO(s, mipsInsn::JR);
-	break;
-      }
-      case 0x09: { /* jalr */
-	state_t::reg_t jaddr = s->gpr[rs];
-	if(rd != 0) {
-	  s->gpr[rd] = s->pc + 8;   /* full 64-bit link (n64 user PCs exceed 32 bits) */
-	}
-	s->pc += 4;
-	if(!run_delay_slot<EL>(s))
-	  s->pc = jaddr;
-	HISTO(s, mipsInsn::JALR);
-	break;
-      }
-      case 0x0C: /* syscall -> trap to kernel (ExcCode 8) */
-	raise_syscall(s);
-	HISTO(s, mipsInsn::BREAK);
-	break;
-      case 0x0D: /* break -> trap to kernel (ExcCode 9) */
-	raise_break(s);
-	HISTO(s, mipsInsn::BREAK);
-	break;
-      case 0x0f: /* sync */
-	s->pc += 4;
-	HISTO(s, mipsInsn::SYNC);
-	break;
-      case 0x10: /* mfhi */
-	s->gpr[rd] = s->hi;
-	s->pc += 4;
-	HISTO(s, mipsInsn::MFHI);
-	break;
-      case 0x11: /* mthi */ 
-	s->hi = s->gpr[rs];
-	s->pc += 4;
-	HISTO(s, mipsInsn::MTHI);
-	break;
-      case 0x12: /* mflo */
-	s->gpr[rd] = s->lo;
-	s->pc += 4;
-	HISTO(s, mipsInsn::MFLO);	
-	break;
-      case 0x13: /* mtlo */
-	s->lo = s->gpr[rs];
-	s->pc += 4;
-	HISTO(s, mipsInsn::MTLO);		
-	break;
-      case 0x18: { /* mult: 32x32 signed (operands are the low 32 bits) */
-	int64_t y;
-	y = (int64_t)(int32_t)s->gpr[rs] * (int64_t)(int32_t)s->gpr[rt];
-	s->lo = (int32_t)(y & 0xffffffff);
-	s->hi = (int32_t)(y >> 32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::MULT);			
-	break;
-      }
-      case 0x19: { /* multu */
-	uint64_t y;
-	uint64_t u0 = (uint64_t)(uint32_t)s->gpr[rs];
-	uint64_t u1 = (uint64_t)(uint32_t)s->gpr[rt];
-	y = u0*u1;
-	s->lo = sext64((uint32_t)y);
-	s->hi = sext64((uint32_t)(y>>32));
-	s->pc += 4;
-	HISTO(s, mipsInsn::MULTU);
-	break;
-      }
-      case 0x1A: /* div: 32-bit signed, sign-extended (int64 avoids INT_MIN/-1 UB) */
-	if((int32_t)s->gpr[rt] != 0) {
-	  int64_t a = (int32_t)s->gpr[rs], b = (int32_t)s->gpr[rt];
-	  s->lo = sext64((uint32_t)(int32_t)(a / b));
-	  s->hi = sext64((uint32_t)(int32_t)(a % b));
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::DIV);
-	break;
-      case 0x1B: /* divu */
-	if(s->gpr[rt] != 0) {
-	  s->lo = sext64((uint32_t)s->gpr[rs] / (uint32_t)s->gpr[rt]);
-	  s->hi = sext64((uint32_t)s->gpr[rs] % (uint32_t)s->gpr[rt]);
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::DIVU);
-	break;
-      case 0x1C: { /* dmult: signed 64x64 -> 128, hi:lo */
-	__int128 y = (__int128)s->gpr[rs] * (__int128)s->gpr[rt];
-	s->lo = (int64_t)(y & 0xffffffffffffffffULL);
-	s->hi = (int64_t)(y >> 64);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DMULT);
-	break;
-      }
-      case 0x1D: { /* dmultu: unsigned 64x64 -> 128, hi:lo */
-	unsigned __int128 y = (unsigned __int128)(uint64_t)s->gpr[rs]
-	                    * (unsigned __int128)(uint64_t)s->gpr[rt];
-	s->lo = (int64_t)(y & 0xffffffffffffffffULL);
-	s->hi = (int64_t)(uint64_t)(y >> 64);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DMULTU);
-	break;
-      }
-      case 0x1E: /* ddiv: signed 64-bit divide */
-	if(s->gpr[rt] != 0) {
-	  s->lo = s->gpr[rs] / s->gpr[rt];
-	  s->hi = s->gpr[rs] % s->gpr[rt];
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::DDIV);
-	break;
-      case 0x1F: /* ddivu: unsigned 64-bit divide */
-	if(s->gpr[rt] != 0) {
-	  s->lo = (int64_t)((uint64_t)s->gpr[rs] / (uint64_t)s->gpr[rt]);
-	  s->hi = (int64_t)((uint64_t)s->gpr[rs] % (uint64_t)s->gpr[rt]);
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::DDIVU);
-	break;
-      case 0x20: { /* add */
-	uint32_t u_rs = (uint32_t)s->gpr[rs];
-	uint32_t u_rt = (uint32_t)s->gpr[rt];
-	uint32_t result = u_rs + u_rt;
-	/* Overflow iff same-sign inputs produce different-sign result.
-	 * Matches RTL: w_add32_overflow = (result[31]!=rt[31]) & (rs[31]==rt[31]) */
-	if (((result >> 31) != (u_rt >> 31)) && ((u_rs >> 31) == (u_rt >> 31))) {
-	  raise_overflow(s);
-	  break;
-	}
-	s->gpr[rd] = sext64(result);
-	s->pc += 4;
-	HISTO(s, mipsInsn::ADD);
-	break;
-      }
-      case 0x21: { /* addu */
-	uint32_t u_rs = (uint32_t)s->gpr[rs];
-	uint32_t u_rt = (uint32_t)s->gpr[rt];
-	s->gpr[rd] = sext64(u_rs + u_rt);
-	s->pc += 4;
-	HISTO(s, mipsInsn::ADDU);
-	break;
-      }
-      case 0x22: { /* sub */
-	uint32_t u_rs = (uint32_t)s->gpr[rs];
-	uint32_t u_rt = (uint32_t)s->gpr[rt];
-	uint32_t result = u_rs - u_rt;
-	/* A-B overflows iff operands differ in sign AND result sign != rs (minuend).
-	 * Matches RTL: w_sub32_overflow = (result[31]!=rs[31]) & (rs[31]!=rt[31]) */
-	if (((result >> 31) != (u_rs >> 31)) && ((u_rs >> 31) != (u_rt >> 31))) {
-	  raise_overflow(s);
-	  break;
-	}
-	s->gpr[rd] = sext64(result);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SUB);
-	break;
-      }
-      case 0x23:{ /*subu*/  
-	uint32_t u_rs = (uint32_t)s->gpr[rs];
-	uint32_t u_rt = (uint32_t)s->gpr[rt];
-	uint32_t y = u_rs - u_rt;
-	s->gpr[rd] = sext64(y);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SUBU);
-	break;
-      }
-      case 0x24: /* and */
-	s->gpr[rd] = s->gpr[rs] & s->gpr[rt];
-	s->pc += 4;
-	HISTO(s, mipsInsn::AND);
-	break;
-      case 0x25: /* or */
-	if(rd != 0) {
-	  s->gpr[rd] = s->gpr[rs] | s->gpr[rt];
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::OR);
-	break;
-      case 0x26: /* xor */
-	s->gpr[rd] = s->gpr[rs] ^ s->gpr[rt];
-	s->pc += 4;
-	HISTO(s, mipsInsn::XOR);	
-	break;
-      case 0x27: /* nor */
-	s->gpr[rd] = ~(s->gpr[rs] | s->gpr[rt]);
-	s->pc += 4;
-	HISTO(s, mipsInsn::NOR);
-	break;
-      case 0x2A: /* slt */
-	s->gpr[rd] = s->gpr[rs] < s->gpr[rt];
-	s->pc += 4;
-	HISTO(s, mipsInsn::SLT);	
-	break;
-      case 0x2B: { /* sltu */
-	s->gpr[rd] = ((uint64_t)s->gpr[rs] < (uint64_t)s->gpr[rt]);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SLTU);
-	break;
-      }
-      case 0x0B: /* movn */
-	s->gpr[rd] = (s->gpr[rt] != 0) ? s->gpr[rs] : s->gpr[rd];
-	s->pc +=4;
-	HISTO(s, mipsInsn::MOVN);
-	break;
-      case 0x0A: /* movz */
-	s->gpr[rd] = (s->gpr[rt] == 0) ? s->gpr[rs] : s->gpr[rd];
-	s->pc += 4;
-	HISTO(s, mipsInsn::MOVZ);	
-	break;
-      case 0x30: /* tge  */
-	if((int64_t)s->gpr[rs] >= (int64_t)s->gpr[rt]) { raise_trap(s); return; }
-	s->pc += 4; HISTO(s, mipsInsn::TGE); break;
-      case 0x31: /* tgeu */
-	if((uint64_t)s->gpr[rs] >= (uint64_t)s->gpr[rt]) { raise_trap(s); return; }
-	s->pc += 4; HISTO(s, mipsInsn::TGEU); break;
-      case 0x32: /* tlt  */
-	if((int64_t)s->gpr[rs] < (int64_t)s->gpr[rt]) { raise_trap(s); return; }
-	s->pc += 4; HISTO(s, mipsInsn::TLT); break;
-      case 0x33: /* tltu */
-	if((uint64_t)s->gpr[rs] < (uint64_t)s->gpr[rt]) { raise_trap(s); return; }
-	s->pc += 4; HISTO(s, mipsInsn::TLTU); break;
-      case 0x34: /* teq */
-	if(s->gpr[rs] == s->gpr[rt]) {
-	  raise_trap(s);
-	  return;
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::TEQ);
-	break;
-      case 0x36: /* tne */
-	if(s->gpr[rs] != s->gpr[rt]) {
-	  raise_trap(s);
-	  return;
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::TNE);
-	break;
-      case 0x2C: { /* dadd */
-	uint64_t u_rs = (uint64_t)s->gpr[rs];
-	uint64_t u_rt = (uint64_t)s->gpr[rt];
-	uint64_t result = u_rs + u_rt;
-	/* Matches RTL: w_add64_overflow = (result[63]!=rt[63]) & (rs[63]==rt[63]) */
-	if (((result >> 63) != (u_rt >> 63)) && ((u_rs >> 63) == (u_rt >> 63))) {
-	  raise_overflow(s);
-	  break;
-	}
-	s->gpr[rd] = (int64_t)result;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DADD);
-	break;
-      }
-      case 0x2D: /* daddu */
-	s->gpr[rd] = s->gpr[rs] + s->gpr[rt];
-	s->pc += 4;
-	HISTO(s, mipsInsn::DADDU);
-	break;
-      case 0x2E: { /* dsub */
-	uint64_t u_rs = (uint64_t)s->gpr[rs];
-	uint64_t u_rt = (uint64_t)s->gpr[rt];
-	uint64_t result = u_rs - u_rt;
-	/* A-B overflows iff operands differ in sign AND result sign != rs (minuend).
-	 * Matches RTL: w_sub64_overflow = (result[63]!=rs[63]) & (rs[63]!=rt[63]) */
-	if (((result >> 63) != (u_rs >> 63)) && ((u_rs >> 63) != (u_rt >> 63))) {
-	  raise_overflow(s);
-	  break;
-	}
-	s->gpr[rd] = (int64_t)result;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSUB);
-	break;
-      }
-      case 0x2F: /* dsubu */
-	s->gpr[rd] = s->gpr[rs] - s->gpr[rt];
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSUBU);
-	break;
-      case 0x14: /* dsllv: rd = rt << rs[5:0] */
-	s->gpr[rd] = s->gpr[rt] << (s->gpr[rs] & 63);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSLLV);
-	break;
-      case 0x16: /* dsrlv: rd = rt >> rs[5:0] (logical) */
-	s->gpr[rd] = (int64_t)((uint64_t)s->gpr[rt] >> (s->gpr[rs] & 63));
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRLV);
-	break;
-      case 0x17: /* dsrav: rd = rt >> rs[5:0] (arithmetic) */
-	s->gpr[rd] = s->gpr[rt] >> (s->gpr[rs] & 63);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRAV);
-	break;
-      case 0x38: /* dsll: rd = rt << sa */
-	s->gpr[rd] = s->gpr[rt] << sa;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSLL);
-	break;
-      case 0x3A: /* dsrl: rd = rt >> sa (logical) */
-	s->gpr[rd] = (int64_t)((uint64_t)s->gpr[rt] >> sa);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRL);
-	break;
-      case 0x3B: /* dsra: rd = rt >> sa (arithmetic) */
-	s->gpr[rd] = s->gpr[rt] >> sa;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRA);
-	break;
-      case 0x3C: /* dsll32: rd = rt << (sa + 32) */
-	s->gpr[rd] = s->gpr[rt] << (sa + 32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSLL32);
-	break;
-      case 0x3E: /* dsrl32: rd = rt >> (sa + 32) (logical) */
-	s->gpr[rd] = (int64_t)((uint64_t)s->gpr[rt] >> (sa + 32));
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRL32);
-	break;
-      case 0x3F: /* dsra32: rd = rt >> (sa + 32) (arithmetic) */
-	s->gpr[rd] = s->gpr[rt] >> (sa + 32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRA32);
-	break;
-      default:
-	raise_ri(s, inst);
-	break;
-      }
-  }
-  else if(isSpecial2 || isSpecial3) {
-    /* RDHWR (SPECIAL3, funct 0x3b) is not in MIPS-III; Linux emulates it via the
-     * RI handler (simulate_rdhwr) for the TLS thread pointer etc.  Raise RI
-     * SILENTLY (matches r9999: unknown SPECIAL3 -> II -> ResI) so the guest
-     * kernel emulates it without spamming the "unimplemented" diagnostic. */
-    if(isSpecial3 && (inst & 0x3fu) == 0x3b)
-      take_exception_ri(s);
-    else
-      raise_ri(s, inst);   /* MIPS32 SPECIAL2/SPECIAL3 are not in MIPS-III (R4000) */
-  }
-  else if(isJType) {
-    state_t::reg_t jaddr = inst & ((1<<26)-1);
-    jaddr <<= 2;
-    if(opcode==0x2) { /* j */
-      s->pc += 4;
-      HISTO(s, mipsInsn::J);
-    }
-    else if(opcode==0x3) { /* jal */
-      s->gpr[31] = s->pc + 8;   /* full 64-bit link (n64 user PCs exceed 32 bits) */
-      s->pc += 4;
-      HISTO(s, mipsInsn::JAL);
-    }
-    else {
-      printf("Unknown JType instruction\n");
-      exit(-1);
-    }
-    jaddr |= (s->pc & (~static_cast<state_t::reg_t>((1<<28)-1)));
-    if(!run_delay_slot<EL>(s))
-      s->pc = jaddr;
-    //printf("new pc = %lx\n", jaddr);
-  }
-  else if(isCoproc0) {
-    if( ((inst >> 25)&1) ) {
-      /* CO=1 instructions: TLB ops, ERET, WAIT */
-      switch(inst & 63)
-	{
-	case 0x1: { /* TLBR -- read TLB[Index] into staging regs */
-	  uint32_t idx = s->cpr0[CPR0_INDEX] & 63;
-	  if(idx < (uint32_t)state_t::NUM_TLB_ENTRIES) {
-	    s->cpr0_64[CPR0_ENTRYHI]  = s->tlb[idx].entry_hi;
-	    s->cpr0_64[CPR0_ENTRYLO0] = s->tlb[idx].entry_lo0;
-	    s->cpr0_64[CPR0_ENTRYLO1] = s->tlb[idx].entry_lo1;
-	    s->cpr0[CPR0_ENTRYHI]     = (uint32_t)s->tlb[idx].entry_hi;
-	    xctx_update(s);
-	    s->cpr0[CPR0_ENTRYLO0]    = (uint32_t)s->tlb[idx].entry_lo0;
-	    s->cpr0[CPR0_ENTRYLO1]    = (uint32_t)s->tlb[idx].entry_lo1;
-	    s->cpr0[CPR0_PAGEMASK]    = s->tlb[idx].page_mask;
-	  }
-	  HISTO(s, mipsInsn::TLBR);
-	  break;
-	}
-	case 0x2: { /* TLBWI -- write staging regs to TLB[Index] */
-	  uint32_t idx = s->cpr0[CPR0_INDEX] & 63;
-	  if(idx < (uint32_t)state_t::NUM_TLB_ENTRIES) {
-	    s->tlb[idx].entry_hi  = s->cpr0_64[CPR0_ENTRYHI];
-	    s->tlb[idx].entry_lo0 = s->cpr0_64[CPR0_ENTRYLO0];
-	    s->tlb[idx].entry_lo1 = s->cpr0_64[CPR0_ENTRYLO1];
-	    s->tlb[idx].page_mask = s->cpr0[CPR0_PAGEMASK];
-	    static const bool g_tlbtally = getenv("TLBTALLY") != nullptr;
-	    if(idx==0 && g_tlbtally) { static uint64_t pv=~0ull; uint64_t c=s->tlb[0].entry_lo1;
-	      if(c!=pv){ fprintf(stderr,"[iss-idx0-wr] hi=%llx lo0=%llx lo1=%llx v1=%d icnt=%lu\n",(unsigned long long)s->tlb[0].entry_hi,(unsigned long long)s->tlb[0].entry_lo0,(unsigned long long)c,(int)((c>>1)&1),(unsigned long)s->icnt); pv=c; } }
-	    assert(valid_page_mask(s->tlb[idx].page_mask));
-	    if(g_tlbpm_on) {
-	      tlbpm_count(s->tlb[idx].entry_hi, s->tlb[idx].page_mask);
-	    }
-	    iss_tlbdup_check(s, idx, "tlbwi");
-	  }
-	  utlb_flush();   /* mapping changed -> drop the micro-TLB */
-	  uitlb_model_flush();
-	  static const bool tlblog = getenv("TLBLOG") != nullptr;
-	  if(tlblog) fprintf(stderr, "[TLBWI] idx=%2u hi=%016llx lo0=%016llx lo1=%016llx pm=%08x\n",
-	     idx, (unsigned long long)s->cpr0_64[CPR0_ENTRYHI], (unsigned long long)s->cpr0_64[CPR0_ENTRYLO0],
-	     (unsigned long long)s->cpr0_64[CPR0_ENTRYLO1], s->cpr0[CPR0_PAGEMASK]);
-	  HISTO(s, mipsInsn::TLBWI);
-	  break;
-	}
-	case 0x6: { /* TLBWR -- write staging regs to TLB[Random] */
-	  uint32_t idx = s->cpr0[CPR0_RANDOM] & 63;
-	  if(idx < (uint32_t)state_t::NUM_TLB_ENTRIES) {
-	    s->tlb[idx].entry_hi  = s->cpr0_64[CPR0_ENTRYHI];
-	    s->tlb[idx].entry_lo0 = s->cpr0_64[CPR0_ENTRYLO0];
-	    s->tlb[idx].entry_lo1 = s->cpr0_64[CPR0_ENTRYLO1];
-	    s->tlb[idx].page_mask = s->cpr0[CPR0_PAGEMASK];
-	    assert(valid_page_mask(s->tlb[idx].page_mask));
-	    if(g_tlbpm_on) {
-	      tlbpm_count(s->tlb[idx].entry_hi, s->tlb[idx].page_mask);
-	    }
-	    iss_tlbdup_check(s, idx, "tlbwr");
-	  }
-	  utlb_flush();   /* mapping changed -> drop the micro-TLB */
-	  uitlb_model_flush();
-	  /* Decrement Random, wrap to NUM_TLB_ENTRIES-1 when it reaches Wired */
-	  {
-	    uint32_t wired  = s->cpr0[CPR0_WIRED] & 63;
-	    uint32_t random = s->cpr0[CPR0_RANDOM] & 63;
-	    s->cpr0[CPR0_RANDOM] = (random <= wired)
-	      ? (uint32_t)(state_t::NUM_TLB_ENTRIES - 1) : (random - 1);
-	  }
-	  static const bool tlblog = getenv("TLBLOG") != nullptr;
-	  if(tlblog && idx < 8) fprintf(stderr, "[TLBWR] idx=%2u hi=%016llx lo0=%016llx lo1=%016llx\n",
-	     idx, (unsigned long long)s->cpr0_64[CPR0_ENTRYHI], (unsigned long long)s->cpr0_64[CPR0_ENTRYLO0],
-	     (unsigned long long)s->cpr0_64[CPR0_ENTRYLO1]);
-	  HISTO(s, mipsInsn::TLBWR);
-	  break;
-	}
-	case 0x8: { /* TLBP -- probe TLB for matching entry */
-	  uint64_t probe_hi   = s->cpr0_64[CPR0_ENTRYHI];
-	  uint64_t probe_asid = probe_hi & 0xffu;
-	  bool found = false;
-	  for(int i = 0; i < state_t::NUM_TLB_ENTRIES; i++) {
-	    /* Apply page-mask to get the significant VPN2 bits */
-	    uint64_t mask    = ~(uint64_t)(s->tlb[i].page_mask | 0x1fffu);
-	    bool global      = (s->tlb[i].entry_lo0 & 1u) &&
-	                       (s->tlb[i].entry_lo1 & 1u);
-	    bool vpn_match   = (probe_hi & mask) == (s->tlb[i].entry_hi & mask);
-	    bool asid_match  = global ||
-	                       (probe_asid == (s->tlb[i].entry_hi & 0xffu));
-	    if(vpn_match && asid_match) {
-	      s->cpr0[CPR0_INDEX] = (uint32_t)i; /* P=0, index=i */
-	      found = true;
-	      break;
-	    }
-	  }
-	  if(!found) {
-	    s->cpr0[CPR0_INDEX] |= (1u << 31); /* P=1 (probe failed) */
-	    static const bool g_tlbp_zero = getenv("TLBP_ZERO_ON_MISS") != nullptr;
-	    if(g_tlbp_zero) s->cpr0[CPR0_INDEX] = (1u << 31); /* mimic r9999: index=0 on TLBP miss */
-	  }
-	  HISTO(s, mipsInsn::TLBP);
-	  break;
-	}
-	case 24: { /* ERET -- exception return */
-	  /* EPC/ErrorEPC are 64-bit on R4000: read the full cpr0_64 view, not the
-	   * 32-bit cpr0[] (which truncates a user EPC like 0x120000190 -> 0x20000190,
-	   * so eret never reaches userspace). Kernel ckseg0 EPCs sign-extend either
-	   * way; userspace n64 EPCs need the full 64 bits. (-4 cancels the loop's
-	   * post-instruction pc+=4.) */
-	  if(s->cpr0[CPR0_SR] & SR_ERL) {
-	    /* Return from error: EPC = ErrorEPC, clear ERL */
-	    s->pc = (state_t::reg_t)s->cpr0_64[CPR0_ERROREPC] - 4;
-	    s->cpr0[CPR0_SR] &= ~SR_ERL;
-	  } else {
-	    /* Return from exception: PC = EPC, clear EXL */
-	    s->pc = (state_t::reg_t)s->cpr0_64[CPR0_EPC] - 4;
-	    s->cpr0[CPR0_SR] &= ~SR_EXL;
-	  }
-	  s->ll_armed = false;   /* R4000: ERET clears LLbit */
-	  xctx_update(s);
-	  HISTO(s, mipsInsn::ERET);
-	  break;
-	}
-	case 32: //WAIT
-	  if((s->cpr0[CPR0_SR] & 1) == 0) {
-	    printf("attempting to wait with interrupts disabled @ VA %x, PA %x\n",
-		   s->pc, VA2PA(s->pc));
-	    exit(-1);
-	  }
-	  HISTO(s, mipsInsn::WAIT);
-	  break;
-	default:
-	  exit(-1);
-	}
-    }
-    else if( (((inst >> 21) & 31) == 11 ) &&
-	     ((inst & 65535) == 0x6000) ) {
-      //DI
-      if(rt != 0) {
-	s->gpr[rt] = s->cpr0[CPR0_SR];
-      }
-      s->cpr0[CPR0_SR] &= (~1U);
-      HISTO(s, mipsInsn::DI);
-    }
-    else if( (((inst >> 21) & 31) == 11 ) &&
-	     ((inst & 65535) == 0x6020) ) {
-      //EI
-      if(rt != 0) {
-	s->gpr[rt] = s->cpr0[CPR0_SR];
-      }
-      s->cpr0[CPR0_SR] |= 1U;
-      HISTO(s, mipsInsn::EI);
-    }
-
-    else {
-      switch(rs)
-	{
-	case 0x0: /*mfc0*/
-	  if(rd == 7) {
-	    s->gpr[rt] = 0;
-	  } else {
-	    /* mfc0 sign-extends the 32-bit CP0 value to 64 bits, matching HW. */
-	    s->gpr[rt] = sext32(s->cpr0[rd]);
-	  }
-	  HISTO(s, mipsInsn::MFC0);
-	  break;
-	case 0x1: /*dmfc0 -- read full 64-bit CP0 register */
-	  s->gpr[rt] = s->cpr0_64[rd];
-	  HISTO(s, mipsInsn::DMFC0);
-	  break;
-	case 0x4: /*mtc0*/
-	  if(rd != 15) { /* PRId (reg 15) is read-only */
-	    /* Sail mips_insts.sail execute(MTC0 ...EntryHi): EntryHi takes its fields
-	     * from the FULL 64-bit GPR (no zero-extend); every other register takes the
-	     * sign-extended low word (MIPS III MTC0 into a 64-bit CP0 register).  Zero-
-	     * extending broke a 32-bit kernel's `mtc0 EPC; eret` to a mapped kseg2/kseg3
-	     * PC: eret went to 0x00000000fce27900 (R=0), which never matches the R=3 TLB
-	     * entry -> endless TLB-invalid loop (NT 4.0 on --jazz).  Reserved fields are
-	     * then dropped per the R4400 spec (cp0_write_mask). */
-	    { uint64_t v = (rd == CPR0_ENTRYHI) ? s->gpr[rt]
-	                                        : (uint64_t)(int64_t)(int32_t)s->gpr[rt];
-	      if(rd == CPR0_CONFIG) {
-	        /* R4400: only K0 [2:0] and CU [3] are writable; IC/DC/IB/DB/SC/... are fixed
-	         * by the part.  Taking the whole word let a PROM/kernel mtc0 clear SC, so
-	         * IRIX sized a secondary cache the configured CPU does not have. */
-	        v = (s->cpr0_64[CPR0_CONFIG] & ~0xfULL) | (v & 0xfULL);
-	      }
-	      s->cpr0_64[rd] = cp0_write_mask(rd, v); }
-	    s->cpr0[rd] = (uint32_t)s->cpr0_64[rd];
-	    if(rd == CPR0_SR || rd == CPR0_ENTRYHI) {
-	      xctx_update(s);
-	    }
-	  }
-	  ptetrack_probe(s, rd, rt);
-	  if(rd == CPR0_COMPARE) { /* writing Compare re-arms + clears the timer interrupt (IP[7]) */
-	    s->cpr0[CPR0_CAUSE] &= ~(1u << 15);
-	    /* TICKPROBE=1: report each Compare arm so the actual IRIX tick period
-	     * (in CP0 Count units) can be measured rather than assumed. */
-	    { static const bool g_tp = getenv("TICKPROBE") != nullptr;
-	      if(g_tp) {
-	        static uint32_t last_arm = 0; static unsigned n = 0;
-	        uint32_t cnt = s->cpr0[CPR0_COUNT];
-	        uint32_t iv  = s->cpr0[CPR0_COMPARE] - cnt;
-	        fprintf(stderr, "[tick] n=%u count=%u compare=%u interval=%u delta_since_last_arm=%u pc=%08x\n",
-	                n++, cnt, s->cpr0[CPR0_COMPARE], iv, cnt - last_arm, (uint32_t)s->pc);
-	        last_arm = cnt;
-	      } }
-	    /* EXPERIMENT (env TIMER_SCALE=N): stretch each timer period N-fold by
-	     * scaling the just-written interval (Compare-Count), leaving Count itself
-	     * untouched so clock calibration (get_r4k_counter) still reads sanely.
-	     * Question: how infrequent can timer IRQs get and still boot IRIX? */
-	    static const unsigned long g_timer_scale =
-	      getenv("TIMER_SCALE") ? strtoul(getenv("TIMER_SCALE"), 0, 0) : 1;
-	    if(g_timer_scale > 1) {
-	      uint32_t cnt = s->cpr0[CPR0_COUNT];
-	      uint32_t interval = s->cpr0[CPR0_COMPARE] - cnt;   /* target - count */
-	      /* Only stretch the LARGE periodic scheduler tick (~millions of Count).
-	       * get_r4k_counter's clock calibration arms a SHORT interval (~4096) and
-	       * spins a bounded countdown waiting for it -- scaling that would break
-	       * calibration (the boot cliff at scale>=16).  Leave short intervals alone. */
-	      if(interval > 100000u) {
-	        s->cpr0[CPR0_COMPARE]    = cnt + interval * (uint32_t)g_timer_scale;
-	        s->cpr0_64[CPR0_COMPARE] = s->cpr0[CPR0_COMPARE];
-	      }
-	    }
-	  }
-	  /* EXPERIMENT (env MTC0_IRQ_PC=<hexpc>): replicate the r9999-precise
-	   * MTC0->Status[IE] CP0 hazard *violation* -- inject a timer IP[7] right
-	   * after the mtc0 that writes c0_sr at the given PC, so the timer fires in
-	   * the mtc0 shadow (the very next instruction).  If the FPGA bad-istack is
-	   * this hazard, the ISS -- which boots past today -- should now panic too. */
-	  if(rd == CPR0_SR) {
-	    static const char *ip = getenv("MTC0_IRQ_PC");
-	    if(ip) {
-	      uint32_t pc = (uint32_t)s->pc;
-	      uint32_t nsr = s->cpr0[CPR0_SR];
-	      /* only inject where the mtc0 actually ENABLES delivery (IE=1,!EXL,!ERL) so
-	       * the timer fires in the shadow of an *enable* -- an mtc0 that keeps ints
-	       * masked can't fire a shadow irq (that was the SR=0x80 IE=0 miss). */
-	      bool enables = (nsr & SR_IE) && !(nsr & (SR_EXL | SR_ERL));
-	      bool all  = (ip[0] == 'a');                            /* "all" */
-	      bool excl = (pc >= 0x88002200u && pc < 0x88002a00u);   /* int-handler region: skip (storm) */
-	      static uint64_t last = 0;
-	      bool fire = enables && (all ? (!excl && (s->icnt - last > 400))
-	                                  : (pc == (uint32_t)strtoul(ip,0,0)));
-	      if(fire) {
-	        s->cpr0[CPR0_CAUSE] |= (1u << 15);   /* IP[7] timer pending -> fires next insn */
-	        last = s->icnt;
-	        static int nf = 0;
-	        if(nf++ < 20) fprintf(stderr, "[INJECT] timer IP7 after mtc0 c0_sr @pc=%08x SR=%08x icnt=%llu\n",
-	                              pc, s->cpr0[CPR0_SR], (unsigned long long)s->icnt);
-	      }
-	    }
-	  }
-	  /* CP0 reg 7 is the simulator putchar port */
-	  if(rd == 7 && !s->silent) {
-	    fputc((int)(s->gpr[rt] & 0xff), stdout);
-	    console_watch(s, (char)(s->gpr[rt] & 0xff));
-	    fflush(stdout);
-	  }
-	  HISTO(s, mipsInsn::MTC0);
-	  break;
-	case 0x5: /*dmtc0 -- write full 64-bit CP0 register */
-	  if(rd != 15) { /* PRId (reg 15) is read-only */
-	    s->cpr0_64[rd] = cp0_write_mask(rd, s->gpr[rt]);
-	    s->cpr0[rd] = (uint32_t)s->cpr0_64[rd];
-	    if(rd == CPR0_SR || rd == CPR0_ENTRYHI) {
-	      xctx_update(s);
-	    }
-	  }
-	  ptetrack_probe(s, rd, rt);
-	  if(rd == 7 && !s->silent) {
-	    fputc((int)(s->gpr[rt] & 0xff), stdout);
-	    console_watch(s, (char)(s->gpr[rt] & 0xff));
-	    fflush(stdout);
-	  }
-	  HISTO(s, mipsInsn::DMTC0);
-	  break;
-	default:
-	  std::cerr << "unhandled cpr0 instruction @ "
-		    << std::hex << s->pc << std::dec << "\n";
-	  exit(-1);
-	  break;
-	}
-      }
-    s->pc += 4;
-  }
-  else if(isCoproc1) 
-    execCoproc1<EL>(inst,s);
-  else if(isCoproc1x)
-    execCoproc1x<EL>(inst,s);
-  else if(isCoproc2) {
-    printf("coproc2 unimplemented\n");  exit(-1);
-  }
-  else if(isLoadLinked) {
-    _lw<EL>(inst, s);
-    if(!s->tlb_fault) s->ll_armed = true;
-  }
-  else if(isStoreCond) {
-    _sc<EL>(inst, s);
-    s->ll_armed = false;
-  }
-  else if(isLoadLinkedD) {
-    _ld<EL>(inst, s);
-    if(!s->tlb_fault) s->ll_armed = true;
-  }
-  else if(isStoreCondD) {
-    _scd<EL>(inst, s);
-    s->ll_armed = false;
-  }
-  else { /* itype */
-    uint32_t uimm32 = inst & ((1<<16) - 1);
-    int16_t simm16 = (int16_t)uimm32;
-    int32_t simm32 = (int32_t)simm16;
-    int32_t tmp;
-    switch(opcode) 
-      {
-      case 0x01:
-	_bgez_bltz<EL>(inst, s); 
-	break;
-      case 0x04:
-	branch<EL,branch_type::beq>(inst, s);
-	break;
-      case 0x05:
-	branch<EL,branch_type::bne>(inst, s); 
-	break;
-      case 0x06:
-	branch<EL,branch_type::blez>(inst, s); 
-	break;
-      case 0x07:
-	branch<EL,branch_type::bgtz>(inst, s); 
-	break;
-      case 0x08: { /* addi: 32-bit add, traps on signed 32-bit overflow */
-	uint32_t u_rs  = (uint32_t)s->gpr[rs];
-	uint32_t u_imm = (uint32_t)simm32;
-	uint32_t result = u_rs + u_imm;
-	/* same rule as add (0x20): same-sign inputs, different-sign result */
-	if (((result >> 31) != (u_imm >> 31)) && ((u_rs >> 31) == (u_imm >> 31))) {
-	  raise_overflow(s);
-	  break;
-	}
-	s->gpr[rt] = sext64(result);
-	s->pc+=4;
-	HISTO(s, mipsInsn::ADDI);
-	break;
-      }
-      case 0x09: /* addiu: 32-bit add, result sign-extended (MIPS64) */
-	tmp = sext64((uint32_t)(s->gpr[rs] + simm32));
-	s->gpr[rt] = tmp;
-	s->pc+=4;
-	HISTO(s, mipsInsn::ADDIU);
-	break;
-      case 0x0A: /* slti */
-	s->gpr[rt] = (s->gpr[rs] < simm32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SLTI);
-	break;
-      case 0x0B:/* sltiu */
-	s->gpr[rt] = ((uint64_t)s->gpr[rs] < (uint64_t)(int64_t)simm32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SLTIU);
-	break;
-      case 0x0c: /* andi */
-	s->gpr[rt] = s->gpr[rs] & uimm32;
-	s->pc += 4;
-	HISTO(s, mipsInsn::ANDI);
-	break;
-      case 0x0d: /* ori */
-	s->gpr[rt] = s->gpr[rs] | uimm32;
-	s->pc += 4;
-	HISTO(s, mipsInsn::ORI);
-	break;
-      case 0x0e: /* xori */
-	s->gpr[rt] = s->gpr[rs] ^ uimm32;
-	s->pc += 4;
-	HISTO(s, mipsInsn::XORI);
-	break;
-      case 0x0F: /* lui */
-	uimm32 <<= 16;
-	s->gpr[rt] = sext64(uimm32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::LUI);
-	break;
-      case 0x14:
-	branch<EL,branch_type::beql>(inst, s); 
-	break;
-      case 0x16:
-	branch<EL,branch_type::blezl>(inst, s); 
-	break;
-      case 0x15:
-	branch<EL,branch_type::bnel>(inst, s); 
-	break;
-      case 0x17:
-	branch<EL,branch_type::bgtzl>(inst, s);
-	break;
-      case 0x18: { /* daddi: doubleword add immediate, traps on signed 64-bit overflow */
-	uint64_t u_rs  = (uint64_t)s->gpr[rs];
-	uint64_t u_imm = (uint64_t)(int64_t)simm32;   /* sign-extend imm to 64 bits */
-	uint64_t result = u_rs + u_imm;
-	/* same overflow rule as dadd (0x2C): same-sign inputs, different-sign result */
-	if (((result >> 63) != (u_imm >> 63)) && ((u_rs >> 63) == (u_imm >> 63))) {
-	  raise_overflow(s);
-	  break;
-	}
-	s->gpr[rt] = (int64_t)result;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DADDI);
-	break;
-      }
-      case 0x19: /* daddiu */
-	s->gpr[rt] = s->gpr[rs] + simm32;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DADDIU);
-	break;
-      case 0x1a:
-	_ldl<EL>(inst, s);
-	break;
-      case 0x1b:
-	_ldr<EL>(inst, s);
-	break;
-      case 0x20:
-	_lb(inst, s);
-	break;
-      case 0x21:
-	_lh<EL>(inst, s);
-	break;
-      case 0x22: 
-	_lwl<EL>(inst, s);
-	break;
-      case 0x23:
-	_lw<EL>(inst, s);
-	break;
-      case 0x24:
-	_lbu(inst, s);
-	break;
-      case 0x27: { /* lwu: load word unsigned (zero-extend to 64 bits) */
-	uint32_t rs_ = (inst >> 21) & 31;
-	uint32_t rt_ = (inst >> 16) & 31;
-	int32_t imm  = (int32_t)(int16_t)(inst & 0xffffu);
-	uint32_t ea  = va_translate(s, s->gpr[rs_] + imm, tlb_op::load);
-	if(s->tlb_fault) break;
-	if(ea & 3) { raise_adel(s); break; }
-	s->gpr[rt_] = (uint64_t)(uint32_t)bswap<EL>(s->mem.get<int32_t>(ea));
-	s->pc += 4;
-	HISTO(s, mipsInsn::LWU);
-	break;
-      }
-      case 0x25:
-	_lhu<EL>(inst, s);
-	break;
-      case 0x26:
-	_lwr<EL>(inst, s);
-	break;
-      case 0x28:
-	_sb(inst, s); 
-	break;
-      case 0x29:
-	_sh<EL>(inst, s); 
-	break;
-      case 0x2a:
-	_swl<EL>(inst, s);
-	break;
-      case 0x2B:
-	_sw<EL>(inst, s);
-	break;
-      case 0x2c:
-	_sdl<EL>(inst, s);
-	break;
-      case 0x2d:
-	_sdr<EL>(inst, s);
-	break;
-      case 0x2e:
-	_swr<EL>(inst, s);
-	break;
-      case 0x2f: /* cache */
-	{
-	  uint32_t rs  = (inst >> 21) & 31;
-	  uint32_t cop = (inst >> 16) & 31;       /* [20:18]=op  [17:16]=cache(0=I,1=D,2=SI,3=SD) */
-	  int16_t  himm = (int16_t)(inst & 0xffff);
-	  uint64_t va  = s->gpr[rs] + (int32_t)himm;
-	  { static const bool g_watchinvl = getenv("WATCHINVL") != nullptr;
-	    if(g_watchinvl) {
-	      uint32_t wpa = 0; bool wm = tlb_probe_ro(s, va, &wpa);
-	      if(wm && ((wpa & ~0x1fu) == 0x0086d81c0u)) {
-		fprintf(stderr, "[invl] icnt=%llu pc=%08x cache=%u op=%u va=%016llx pa=%08x\n",
-			(unsigned long long)s->icnt, (uint32_t)s->pc,
-			(unsigned)(cop & 3), (unsigned)((cop >> 2) & 7),
-			(unsigned long long)va, wpa);
-	      }
-	    }
-	  }
-	  if(g_cache_dbg) {
-	    uint32_t dbgpa = 0; bool mapped = tlb_probe_ro(s, va, &dbgpa);
-	    fprintf(stderr, "[cache] icnt=%llu pc=%08x op=0x%02x va=%016llx pa=%08x set=%u\n",
-		    (unsigned long long)s->icnt, (uint32_t)s->pc, cop,
-		    (unsigned long long)va, mapped ? dbgpa : (uint32_t)(va & 0x1fffffff),
-		    cache_model::set_of(mapped ? dbgpa : (uint32_t)(va & 0x1fffffff)));
-	  }
-	  { /* SCSIZE: emulate the SD tag ops for size_2nd_cache (Index_Store_Tag_SD at
-	     * index 0, then Index_Load_Tag_SD at 128K, 256K, ... until it reads back the
-	     * zero it stored = the index wrapped).  Tags are keyed by the SC index. */
-	    static const uint32_t g_scsize = getenv("SCSIZE") ? (uint32_t)strtoul(getenv("SCSIZE"), 0, 0) : 0;
-	    static std::unordered_map<uint32_t, uint32_t> g_sctag;
-	    uint32_t which = cop & 0x3, op = (cop >> 2) & 0x7;
-	    if(g_scsize && which == 3 && (op == 1 || op == 2)) {
-	      uint32_t idx = (uint32_t)(va & 0x1fffffffu) % g_scsize;
-	      if(op == 2) {
-		g_sctag[idx] = (uint32_t)s->cpr0[28];              /* Index_Store_Tag_SD <- TagLo */
-	      }
-	      else {
-		auto it = g_sctag.find(idx);                        /* Index_Load_Tag_SD -> TagLo */
-		uint32_t t = (it != g_sctag.end()) ? it->second : (0x80000000u | (uint32_t)(va & 0x1fffffffu) >> 4);
-		s->cpr0[28] = t;
-		s->cpr0_64[28] = t;
-	      }
-	    }
-	    if(sclog_file() && (which == 1 || which == 3)) {
-	      /* hit ops name a physical line; index ops an index (log va & 0x1fffffff) */
-	      uint32_t lpa = (uint32_t)(va & 0x1fffffffu);
-	      if(op >= 4) {
-		uint32_t tpa = 0;
-		lpa = tlb_probe_ro(s, va, &tpa) ? tpa : 0xffffffffu;
-	      }
-	      sclog(1, s->icnt, lpa, 0, (uint32_t)s->pc, (uint8_t)cop);
-	    }
-	  }
-	  if(g_cmodel) {
-	    uint32_t which   = cop & 0x3;         /* 0=I 1=D 2=SI 3=SD */
-	    uint32_t cacheop = (cop >> 2) & 0x7;  /* 0=IdxWBInv 4=HitInv 5=HitWBInv 6=HitWB */
-	    uint32_t pa = 0;
-	    if(which == 1) {                      /* primary D-cache */
-	      switch(cacheop) {
-	      case 0: g_cmodel->index_wb_inval((uint32_t)va); break;      /* Index_WB_Invalidate */
-	      case 4: if(tlb_probe_ro(s, va, &pa)) g_cmodel->hit_inval(pa);    break; /* Hit_Invalidate */
-	      case 5: if(tlb_probe_ro(s, va, &pa)) g_cmodel->hit_wb_inval(pa); break; /* Hit_WB_Invalidate */
-	      case 6: if(tlb_probe_ro(s, va, &pa)) g_cmodel->hit_wb(pa);       break; /* Hit_WB */
-	      default: break;                     /* Index_Load/Store_Tag: no-op (model starts clean) */
-	      }
-	    }
-	    /* I-cache (which==0): D-only model + DRAM-direct fetch already captures code
-	     * coherence (a fetch reads DRAM, so the D-cache must be WB'd first).
-	     * SD/SI (which 2,3): no secondary cache -> no-op. */
-	  }
-	  s->pc += 4;
-	}
-	break;
-      case 0x31:
-	_lwc1<EL>(inst, s);
-	break;
-      case 0x33: /* prefetch */
-	s->pc += 4;
-	break;
-      case 0x35:
-	_ldc1<EL>(inst, s);
-	break;
-      case 0x39:
-	_swc1<EL>(inst, s);
-	break;
-      case 0x37:
-	_ld<EL>(inst, s);
-	break;
-      case 0x3D:
-	_sdc1<EL>(inst, s);
-	break;
-      case 0x3F:
-	_sd<EL>(inst, s);
-	break;
-      default:
-	raise_ri(s, inst);
-	break;
-      }
-  }
-}
-
-/* SPECIAL (R-type) ops (verbatim from exec_generic; the decoder routes only words that need none of
- * its pre-dispatch checks here) */
-template <bool EL>
-static void exec_rtype(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem;
-  (void)mem;
-  uint32_t opcode = inst>>26;
-  uint32_t rs = (inst >> 21) & 31;
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rd = (inst >> 11) & 31;
-  (void)opcode; (void)rs; (void)rt; (void)rd;
-    uint32_t funct = inst & 63;
-    uint32_t sa = (inst >> 6) & 31;
-    switch(funct) 
-      {
-      case 0x00: /*sll*/
-	s->gpr[rd] = static_cast<int32_t>(s->gpr[rt]) << sa;
-	s->pc += 4;
-	if(inst == 0) {
-	  HISTO(s, mipsInsn::NOP);
-	}
-	else {
-	  HISTO(s, mipsInsn::SLL);
-	}
-	break;
-      case 0x01: /* movci */
-	_movci(inst,s);
-	break;
-      case 0x02: /* srl */
-	s->gpr[rd] = sext64(((uint32_t)s->gpr[rt] >> sa));
-	s->pc += 4;
-	HISTO(s, mipsInsn::SRL);
-	break;
-      case 0x03: /* sra */
-	s->gpr[rd] = static_cast<int32_t>(s->gpr[rt]) >> sa;
-	s->pc += 4;
-	HISTO(s, mipsInsn::SRA);
-	break;	
-      case 0x04: /* sllv */
-	s->gpr[rd] = sext64(static_cast<uint32_t>(s->gpr[rt]) << (s->gpr[rs] & 0x1f));
-	s->pc += 4;
-	HISTO(s, mipsInsn::SLLV);
-	break;
-      case 0x06:  /* srlv: sign-extend the 32-bit logical-shift result (MIPS64) */
-	s->gpr[rd] = sext64((uint32_t)s->gpr[rt] >> (s->gpr[rs] & 0x1f));
-	s->pc += 4;
-	HISTO(s, mipsInsn::SRLV);
-	break;
-      case 0x07:  /* srav: 32-bit arithmetic shift, result sign-extended (MIPS64) */
-	s->gpr[rd] = static_cast<int32_t>(s->gpr[rt]) >> (s->gpr[rs] & 0x1f);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SRAV);
-	break;
-      case 0x08: { /* jr */
-	state_t::reg_t jaddr = s->gpr[rs];
-	s->pc += 4;
-	if(!run_delay_slot<EL>(s))
-	  s->pc = jaddr;
-	HISTO(s, mipsInsn::JR);
-	break;
-      }
-      case 0x09: { /* jalr */
-	state_t::reg_t jaddr = s->gpr[rs];
-	if(rd != 0) {
-	  s->gpr[rd] = s->pc + 8;   /* full 64-bit link (n64 user PCs exceed 32 bits) */
-	}
-	s->pc += 4;
-	if(!run_delay_slot<EL>(s))
-	  s->pc = jaddr;
-	HISTO(s, mipsInsn::JALR);
-	break;
-      }
-      case 0x0C: /* syscall -> trap to kernel (ExcCode 8) */
-	raise_syscall(s);
-	HISTO(s, mipsInsn::BREAK);
-	break;
-      case 0x0D: /* break -> trap to kernel (ExcCode 9) */
-	raise_break(s);
-	HISTO(s, mipsInsn::BREAK);
-	break;
-      case 0x0f: /* sync */
-	s->pc += 4;
-	HISTO(s, mipsInsn::SYNC);
-	break;
-      case 0x10: /* mfhi */
-	s->gpr[rd] = s->hi;
-	s->pc += 4;
-	HISTO(s, mipsInsn::MFHI);
-	break;
-      case 0x11: /* mthi */ 
-	s->hi = s->gpr[rs];
-	s->pc += 4;
-	HISTO(s, mipsInsn::MTHI);
-	break;
-      case 0x12: /* mflo */
-	s->gpr[rd] = s->lo;
-	s->pc += 4;
-	HISTO(s, mipsInsn::MFLO);	
-	break;
-      case 0x13: /* mtlo */
-	s->lo = s->gpr[rs];
-	s->pc += 4;
-	HISTO(s, mipsInsn::MTLO);		
-	break;
-      case 0x18: { /* mult: 32x32 signed (operands are the low 32 bits) */
-	int64_t y;
-	y = (int64_t)(int32_t)s->gpr[rs] * (int64_t)(int32_t)s->gpr[rt];
-	s->lo = (int32_t)(y & 0xffffffff);
-	s->hi = (int32_t)(y >> 32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::MULT);			
-	break;
-      }
-      case 0x19: { /* multu */
-	uint64_t y;
-	uint64_t u0 = (uint64_t)(uint32_t)s->gpr[rs];
-	uint64_t u1 = (uint64_t)(uint32_t)s->gpr[rt];
-	y = u0*u1;
-	s->lo = sext64((uint32_t)y);
-	s->hi = sext64((uint32_t)(y>>32));
-	s->pc += 4;
-	HISTO(s, mipsInsn::MULTU);
-	break;
-      }
-      case 0x1A: /* div: 32-bit signed, sign-extended (int64 avoids INT_MIN/-1 UB) */
-	if((int32_t)s->gpr[rt] != 0) {
-	  int64_t a = (int32_t)s->gpr[rs], b = (int32_t)s->gpr[rt];
-	  s->lo = sext64((uint32_t)(int32_t)(a / b));
-	  s->hi = sext64((uint32_t)(int32_t)(a % b));
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::DIV);
-	break;
-      case 0x1B: /* divu */
-	if(s->gpr[rt] != 0) {
-	  s->lo = sext64((uint32_t)s->gpr[rs] / (uint32_t)s->gpr[rt]);
-	  s->hi = sext64((uint32_t)s->gpr[rs] % (uint32_t)s->gpr[rt]);
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::DIVU);
-	break;
-      case 0x1C: { /* dmult: signed 64x64 -> 128, hi:lo */
-	__int128 y = (__int128)s->gpr[rs] * (__int128)s->gpr[rt];
-	s->lo = (int64_t)(y & 0xffffffffffffffffULL);
-	s->hi = (int64_t)(y >> 64);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DMULT);
-	break;
-      }
-      case 0x1D: { /* dmultu: unsigned 64x64 -> 128, hi:lo */
-	unsigned __int128 y = (unsigned __int128)(uint64_t)s->gpr[rs]
-	                    * (unsigned __int128)(uint64_t)s->gpr[rt];
-	s->lo = (int64_t)(y & 0xffffffffffffffffULL);
-	s->hi = (int64_t)(uint64_t)(y >> 64);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DMULTU);
-	break;
-      }
-      case 0x1E: /* ddiv: signed 64-bit divide */
-	if(s->gpr[rt] != 0) {
-	  s->lo = s->gpr[rs] / s->gpr[rt];
-	  s->hi = s->gpr[rs] % s->gpr[rt];
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::DDIV);
-	break;
-      case 0x1F: /* ddivu: unsigned 64-bit divide */
-	if(s->gpr[rt] != 0) {
-	  s->lo = (int64_t)((uint64_t)s->gpr[rs] / (uint64_t)s->gpr[rt]);
-	  s->hi = (int64_t)((uint64_t)s->gpr[rs] % (uint64_t)s->gpr[rt]);
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::DDIVU);
-	break;
-      case 0x20: { /* add */
-	uint32_t u_rs = (uint32_t)s->gpr[rs];
-	uint32_t u_rt = (uint32_t)s->gpr[rt];
-	uint32_t result = u_rs + u_rt;
-	/* Overflow iff same-sign inputs produce different-sign result.
-	 * Matches RTL: w_add32_overflow = (result[31]!=rt[31]) & (rs[31]==rt[31]) */
-	if (((result >> 31) != (u_rt >> 31)) && ((u_rs >> 31) == (u_rt >> 31))) {
-	  raise_overflow(s);
-	  break;
-	}
-	s->gpr[rd] = sext64(result);
-	s->pc += 4;
-	HISTO(s, mipsInsn::ADD);
-	break;
-      }
-      case 0x21: { /* addu */
-	uint32_t u_rs = (uint32_t)s->gpr[rs];
-	uint32_t u_rt = (uint32_t)s->gpr[rt];
-	s->gpr[rd] = sext64(u_rs + u_rt);
-	s->pc += 4;
-	HISTO(s, mipsInsn::ADDU);
-	break;
-      }
-      case 0x22: { /* sub */
-	uint32_t u_rs = (uint32_t)s->gpr[rs];
-	uint32_t u_rt = (uint32_t)s->gpr[rt];
-	uint32_t result = u_rs - u_rt;
-	/* A-B overflows iff operands differ in sign AND result sign != rs (minuend).
-	 * Matches RTL: w_sub32_overflow = (result[31]!=rs[31]) & (rs[31]!=rt[31]) */
-	if (((result >> 31) != (u_rs >> 31)) && ((u_rs >> 31) != (u_rt >> 31))) {
-	  raise_overflow(s);
-	  break;
-	}
-	s->gpr[rd] = sext64(result);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SUB);
-	break;
-      }
-      case 0x23:{ /*subu*/  
-	uint32_t u_rs = (uint32_t)s->gpr[rs];
-	uint32_t u_rt = (uint32_t)s->gpr[rt];
-	uint32_t y = u_rs - u_rt;
-	s->gpr[rd] = sext64(y);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SUBU);
-	break;
-      }
-      case 0x24: /* and */
-	s->gpr[rd] = s->gpr[rs] & s->gpr[rt];
-	s->pc += 4;
-	HISTO(s, mipsInsn::AND);
-	break;
-      case 0x25: /* or */
-	if(rd != 0) {
-	  s->gpr[rd] = s->gpr[rs] | s->gpr[rt];
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::OR);
-	break;
-      case 0x26: /* xor */
-	s->gpr[rd] = s->gpr[rs] ^ s->gpr[rt];
-	s->pc += 4;
-	HISTO(s, mipsInsn::XOR);	
-	break;
-      case 0x27: /* nor */
-	s->gpr[rd] = ~(s->gpr[rs] | s->gpr[rt]);
-	s->pc += 4;
-	HISTO(s, mipsInsn::NOR);
-	break;
-      case 0x2A: /* slt */
-	s->gpr[rd] = s->gpr[rs] < s->gpr[rt];
-	s->pc += 4;
-	HISTO(s, mipsInsn::SLT);	
-	break;
-      case 0x2B: { /* sltu */
-	s->gpr[rd] = ((uint64_t)s->gpr[rs] < (uint64_t)s->gpr[rt]);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SLTU);
-	break;
-      }
-      case 0x0B: /* movn */
-	s->gpr[rd] = (s->gpr[rt] != 0) ? s->gpr[rs] : s->gpr[rd];
-	s->pc +=4;
-	HISTO(s, mipsInsn::MOVN);
-	break;
-      case 0x0A: /* movz */
-	s->gpr[rd] = (s->gpr[rt] == 0) ? s->gpr[rs] : s->gpr[rd];
-	s->pc += 4;
-	HISTO(s, mipsInsn::MOVZ);	
-	break;
-      case 0x30: /* tge  */
-	if((int64_t)s->gpr[rs] >= (int64_t)s->gpr[rt]) { raise_trap(s); return; }
-	s->pc += 4; HISTO(s, mipsInsn::TGE); break;
-      case 0x31: /* tgeu */
-	if((uint64_t)s->gpr[rs] >= (uint64_t)s->gpr[rt]) { raise_trap(s); return; }
-	s->pc += 4; HISTO(s, mipsInsn::TGEU); break;
-      case 0x32: /* tlt  */
-	if((int64_t)s->gpr[rs] < (int64_t)s->gpr[rt]) { raise_trap(s); return; }
-	s->pc += 4; HISTO(s, mipsInsn::TLT); break;
-      case 0x33: /* tltu */
-	if((uint64_t)s->gpr[rs] < (uint64_t)s->gpr[rt]) { raise_trap(s); return; }
-	s->pc += 4; HISTO(s, mipsInsn::TLTU); break;
-      case 0x34: /* teq */
-	if(s->gpr[rs] == s->gpr[rt]) {
-	  raise_trap(s);
-	  return;
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::TEQ);
-	break;
-      case 0x36: /* tne */
-	if(s->gpr[rs] != s->gpr[rt]) {
-	  raise_trap(s);
-	  return;
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::TNE);
-	break;
-      case 0x2C: { /* dadd */
-	uint64_t u_rs = (uint64_t)s->gpr[rs];
-	uint64_t u_rt = (uint64_t)s->gpr[rt];
-	uint64_t result = u_rs + u_rt;
-	/* Matches RTL: w_add64_overflow = (result[63]!=rt[63]) & (rs[63]==rt[63]) */
-	if (((result >> 63) != (u_rt >> 63)) && ((u_rs >> 63) == (u_rt >> 63))) {
-	  raise_overflow(s);
-	  break;
-	}
-	s->gpr[rd] = (int64_t)result;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DADD);
-	break;
-      }
-      case 0x2D: /* daddu */
-	s->gpr[rd] = s->gpr[rs] + s->gpr[rt];
-	s->pc += 4;
-	HISTO(s, mipsInsn::DADDU);
-	break;
-      case 0x2E: { /* dsub */
-	uint64_t u_rs = (uint64_t)s->gpr[rs];
-	uint64_t u_rt = (uint64_t)s->gpr[rt];
-	uint64_t result = u_rs - u_rt;
-	/* A-B overflows iff operands differ in sign AND result sign != rs (minuend).
-	 * Matches RTL: w_sub64_overflow = (result[63]!=rs[63]) & (rs[63]!=rt[63]) */
-	if (((result >> 63) != (u_rs >> 63)) && ((u_rs >> 63) != (u_rt >> 63))) {
-	  raise_overflow(s);
-	  break;
-	}
-	s->gpr[rd] = (int64_t)result;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSUB);
-	break;
-      }
-      case 0x2F: /* dsubu */
-	s->gpr[rd] = s->gpr[rs] - s->gpr[rt];
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSUBU);
-	break;
-      case 0x14: /* dsllv: rd = rt << rs[5:0] */
-	s->gpr[rd] = s->gpr[rt] << (s->gpr[rs] & 63);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSLLV);
-	break;
-      case 0x16: /* dsrlv: rd = rt >> rs[5:0] (logical) */
-	s->gpr[rd] = (int64_t)((uint64_t)s->gpr[rt] >> (s->gpr[rs] & 63));
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRLV);
-	break;
-      case 0x17: /* dsrav: rd = rt >> rs[5:0] (arithmetic) */
-	s->gpr[rd] = s->gpr[rt] >> (s->gpr[rs] & 63);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRAV);
-	break;
-      case 0x38: /* dsll: rd = rt << sa */
-	s->gpr[rd] = s->gpr[rt] << sa;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSLL);
-	break;
-      case 0x3A: /* dsrl: rd = rt >> sa (logical) */
-	s->gpr[rd] = (int64_t)((uint64_t)s->gpr[rt] >> sa);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRL);
-	break;
-      case 0x3B: /* dsra: rd = rt >> sa (arithmetic) */
-	s->gpr[rd] = s->gpr[rt] >> sa;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRA);
-	break;
-      case 0x3C: /* dsll32: rd = rt << (sa + 32) */
-	s->gpr[rd] = s->gpr[rt] << (sa + 32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSLL32);
-	break;
-      case 0x3E: /* dsrl32: rd = rt >> (sa + 32) (logical) */
-	s->gpr[rd] = (int64_t)((uint64_t)s->gpr[rt] >> (sa + 32));
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRL32);
-	break;
-      case 0x3F: /* dsra32: rd = rt >> (sa + 32) (arithmetic) */
-	s->gpr[rd] = s->gpr[rt] >> (sa + 32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRA32);
-	break;
-      default:
-	raise_ri(s, inst);
-	break;
-      }
-}
-
-/* J/JAL (verbatim from exec_generic; the decoder routes only words that need none of
- * its pre-dispatch checks here) */
-template <bool EL>
-static void exec_jtype(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem;
-  (void)mem;
-  uint32_t opcode = inst>>26;
-  uint32_t rs = (inst >> 21) & 31;
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rd = (inst >> 11) & 31;
-  (void)opcode; (void)rs; (void)rt; (void)rd;
-    state_t::reg_t jaddr = inst & ((1<<26)-1);
-    jaddr <<= 2;
-    if(opcode==0x2) { /* j */
-      s->pc += 4;
-      HISTO(s, mipsInsn::J);
-    }
-    else if(opcode==0x3) { /* jal */
-      s->gpr[31] = s->pc + 8;   /* full 64-bit link (n64 user PCs exceed 32 bits) */
-      s->pc += 4;
-      HISTO(s, mipsInsn::JAL);
-    }
-    else {
-      printf("Unknown JType instruction\n");
-      exit(-1);
-    }
-    jaddr |= (s->pc & (~static_cast<state_t::reg_t>((1<<28)-1)));
-    if(!run_delay_slot<EL>(s))
-      s->pc = jaddr;
-    //printf("new pc = %lx\n", jaddr);
-}
-
-/* I-type ops (verbatim from exec_generic; the decoder routes only words that need none of
- * its pre-dispatch checks here) */
-template <bool EL>
-static void exec_itype(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem;
-  (void)mem;
-  uint32_t opcode = inst>>26;
-  uint32_t rs = (inst >> 21) & 31;
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rd = (inst >> 11) & 31;
-  (void)opcode; (void)rs; (void)rt; (void)rd;
-    uint32_t uimm32 = inst & ((1<<16) - 1);
-    int16_t simm16 = (int16_t)uimm32;
-    int32_t simm32 = (int32_t)simm16;
-    int32_t tmp;
-    switch(opcode) 
-      {
-      case 0x01:
-	_bgez_bltz<EL>(inst, s); 
-	break;
-      case 0x04:
-	branch<EL,branch_type::beq>(inst, s);
-	break;
-      case 0x05:
-	branch<EL,branch_type::bne>(inst, s); 
-	break;
-      case 0x06:
-	branch<EL,branch_type::blez>(inst, s); 
-	break;
-      case 0x07:
-	branch<EL,branch_type::bgtz>(inst, s); 
-	break;
-      case 0x08: { /* addi: 32-bit add, traps on signed 32-bit overflow */
-	uint32_t u_rs  = (uint32_t)s->gpr[rs];
-	uint32_t u_imm = (uint32_t)simm32;
-	uint32_t result = u_rs + u_imm;
-	/* same rule as add (0x20): same-sign inputs, different-sign result */
-	if (((result >> 31) != (u_imm >> 31)) && ((u_rs >> 31) == (u_imm >> 31))) {
-	  raise_overflow(s);
-	  break;
-	}
-	s->gpr[rt] = sext64(result);
-	s->pc+=4;
-	HISTO(s, mipsInsn::ADDI);
-	break;
-      }
-      case 0x09: /* addiu: 32-bit add, result sign-extended (MIPS64) */
-	tmp = sext64((uint32_t)(s->gpr[rs] + simm32));
-	s->gpr[rt] = tmp;
-	s->pc+=4;
-	HISTO(s, mipsInsn::ADDIU);
-	break;
-      case 0x0A: /* slti */
-	s->gpr[rt] = (s->gpr[rs] < simm32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SLTI);
-	break;
-      case 0x0B:/* sltiu */
-	s->gpr[rt] = ((uint64_t)s->gpr[rs] < (uint64_t)(int64_t)simm32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SLTIU);
-	break;
-      case 0x0c: /* andi */
-	s->gpr[rt] = s->gpr[rs] & uimm32;
-	s->pc += 4;
-	HISTO(s, mipsInsn::ANDI);
-	break;
-      case 0x0d: /* ori */
-	s->gpr[rt] = s->gpr[rs] | uimm32;
-	s->pc += 4;
-	HISTO(s, mipsInsn::ORI);
-	break;
-      case 0x0e: /* xori */
-	s->gpr[rt] = s->gpr[rs] ^ uimm32;
-	s->pc += 4;
-	HISTO(s, mipsInsn::XORI);
-	break;
-      case 0x0F: /* lui */
-	uimm32 <<= 16;
-	s->gpr[rt] = sext64(uimm32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::LUI);
-	break;
-      case 0x14:
-	branch<EL,branch_type::beql>(inst, s); 
-	break;
-      case 0x16:
-	branch<EL,branch_type::blezl>(inst, s); 
-	break;
-      case 0x15:
-	branch<EL,branch_type::bnel>(inst, s); 
-	break;
-      case 0x17:
-	branch<EL,branch_type::bgtzl>(inst, s);
-	break;
-      case 0x18: { /* daddi: doubleword add immediate, traps on signed 64-bit overflow */
-	uint64_t u_rs  = (uint64_t)s->gpr[rs];
-	uint64_t u_imm = (uint64_t)(int64_t)simm32;   /* sign-extend imm to 64 bits */
-	uint64_t result = u_rs + u_imm;
-	/* same overflow rule as dadd (0x2C): same-sign inputs, different-sign result */
-	if (((result >> 63) != (u_imm >> 63)) && ((u_rs >> 63) == (u_imm >> 63))) {
-	  raise_overflow(s);
-	  break;
-	}
-	s->gpr[rt] = (int64_t)result;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DADDI);
-	break;
-      }
-      case 0x19: /* daddiu */
-	s->gpr[rt] = s->gpr[rs] + simm32;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DADDIU);
-	break;
-      case 0x1a:
-	_ldl<EL>(inst, s);
-	break;
-      case 0x1b:
-	_ldr<EL>(inst, s);
-	break;
-      case 0x20:
-	_lb(inst, s);
-	break;
-      case 0x21:
-	_lh<EL>(inst, s);
-	break;
-      case 0x22: 
-	_lwl<EL>(inst, s);
-	break;
-      case 0x23:
-	_lw<EL>(inst, s);
-	break;
-      case 0x24:
-	_lbu(inst, s);
-	break;
-      case 0x27: { /* lwu: load word unsigned (zero-extend to 64 bits) */
-	uint32_t rs_ = (inst >> 21) & 31;
-	uint32_t rt_ = (inst >> 16) & 31;
-	int32_t imm  = (int32_t)(int16_t)(inst & 0xffffu);
-	uint32_t ea  = va_translate(s, s->gpr[rs_] + imm, tlb_op::load);
-	if(s->tlb_fault) break;
-	if(ea & 3) { raise_adel(s); break; }
-	s->gpr[rt_] = (uint64_t)(uint32_t)bswap<EL>(s->mem.get<int32_t>(ea));
-	s->pc += 4;
-	HISTO(s, mipsInsn::LWU);
-	break;
-      }
-      case 0x25:
-	_lhu<EL>(inst, s);
-	break;
-      case 0x26:
-	_lwr<EL>(inst, s);
-	break;
-      case 0x28:
-	_sb(inst, s); 
-	break;
-      case 0x29:
-	_sh<EL>(inst, s); 
-	break;
-      case 0x2a:
-	_swl<EL>(inst, s);
-	break;
-      case 0x2B:
-	_sw<EL>(inst, s);
-	break;
-      case 0x2c:
-	_sdl<EL>(inst, s);
-	break;
-      case 0x2d:
-	_sdr<EL>(inst, s);
-	break;
-      case 0x2e:
-	_swr<EL>(inst, s);
-	break;
-      case 0x2f: /* cache */
-	{
-	  uint32_t rs  = (inst >> 21) & 31;
-	  uint32_t cop = (inst >> 16) & 31;       /* [20:18]=op  [17:16]=cache(0=I,1=D,2=SI,3=SD) */
-	  int16_t  himm = (int16_t)(inst & 0xffff);
-	  uint64_t va  = s->gpr[rs] + (int32_t)himm;
-	  { static const bool g_watchinvl = getenv("WATCHINVL") != nullptr;
-	    if(g_watchinvl) {
-	      uint32_t wpa = 0; bool wm = tlb_probe_ro(s, va, &wpa);
-	      if(wm && ((wpa & ~0x1fu) == 0x0086d81c0u)) {
-		fprintf(stderr, "[invl] icnt=%llu pc=%08x cache=%u op=%u va=%016llx pa=%08x\n",
-			(unsigned long long)s->icnt, (uint32_t)s->pc,
-			(unsigned)(cop & 3), (unsigned)((cop >> 2) & 7),
-			(unsigned long long)va, wpa);
-	      }
-	    }
-	  }
-	  if(g_cache_dbg) {
-	    uint32_t dbgpa = 0; bool mapped = tlb_probe_ro(s, va, &dbgpa);
-	    fprintf(stderr, "[cache] icnt=%llu pc=%08x op=0x%02x va=%016llx pa=%08x set=%u\n",
-		    (unsigned long long)s->icnt, (uint32_t)s->pc, cop,
-		    (unsigned long long)va, mapped ? dbgpa : (uint32_t)(va & 0x1fffffff),
-		    cache_model::set_of(mapped ? dbgpa : (uint32_t)(va & 0x1fffffff)));
-	  }
-	  { /* SCSIZE: emulate the SD tag ops for size_2nd_cache (Index_Store_Tag_SD at
-	     * index 0, then Index_Load_Tag_SD at 128K, 256K, ... until it reads back the
-	     * zero it stored = the index wrapped).  Tags are keyed by the SC index. */
-	    static const uint32_t g_scsize = getenv("SCSIZE") ? (uint32_t)strtoul(getenv("SCSIZE"), 0, 0) : 0;
-	    static std::unordered_map<uint32_t, uint32_t> g_sctag;
-	    uint32_t which = cop & 0x3, op = (cop >> 2) & 0x7;
-	    if(g_scsize && which == 3 && (op == 1 || op == 2)) {
-	      uint32_t idx = (uint32_t)(va & 0x1fffffffu) % g_scsize;
-	      if(op == 2) {
-		g_sctag[idx] = (uint32_t)s->cpr0[28];              /* Index_Store_Tag_SD <- TagLo */
-	      }
-	      else {
-		auto it = g_sctag.find(idx);                        /* Index_Load_Tag_SD -> TagLo */
-		uint32_t t = (it != g_sctag.end()) ? it->second : (0x80000000u | (uint32_t)(va & 0x1fffffffu) >> 4);
-		s->cpr0[28] = t;
-		s->cpr0_64[28] = t;
-	      }
-	    }
-	    if(sclog_file() && (which == 1 || which == 3)) {
-	      /* hit ops name a physical line; index ops an index (log va & 0x1fffffff) */
-	      uint32_t lpa = (uint32_t)(va & 0x1fffffffu);
-	      if(op >= 4) {
-		uint32_t tpa = 0;
-		lpa = tlb_probe_ro(s, va, &tpa) ? tpa : 0xffffffffu;
-	      }
-	      sclog(1, s->icnt, lpa, 0, (uint32_t)s->pc, (uint8_t)cop);
-	    }
-	  }
-	  if(g_cmodel) {
-	    uint32_t which   = cop & 0x3;         /* 0=I 1=D 2=SI 3=SD */
-	    uint32_t cacheop = (cop >> 2) & 0x7;  /* 0=IdxWBInv 4=HitInv 5=HitWBInv 6=HitWB */
-	    uint32_t pa = 0;
-	    if(which == 1) {                      /* primary D-cache */
-	      switch(cacheop) {
-	      case 0: g_cmodel->index_wb_inval((uint32_t)va); break;      /* Index_WB_Invalidate */
-	      case 4: if(tlb_probe_ro(s, va, &pa)) g_cmodel->hit_inval(pa);    break; /* Hit_Invalidate */
-	      case 5: if(tlb_probe_ro(s, va, &pa)) g_cmodel->hit_wb_inval(pa); break; /* Hit_WB_Invalidate */
-	      case 6: if(tlb_probe_ro(s, va, &pa)) g_cmodel->hit_wb(pa);       break; /* Hit_WB */
-	      default: break;                     /* Index_Load/Store_Tag: no-op (model starts clean) */
-	      }
-	    }
-	    /* I-cache (which==0): D-only model + DRAM-direct fetch already captures code
-	     * coherence (a fetch reads DRAM, so the D-cache must be WB'd first).
-	     * SD/SI (which 2,3): no secondary cache -> no-op. */
-	  }
-	  s->pc += 4;
-	}
-	break;
-      case 0x31:
-	_lwc1<EL>(inst, s);
-	break;
-      case 0x33: /* prefetch */
-	s->pc += 4;
-	break;
-      case 0x35:
-	_ldc1<EL>(inst, s);
-	break;
-      case 0x39:
-	_swc1<EL>(inst, s);
-	break;
-      case 0x37:
-	_ld<EL>(inst, s);
-	break;
-      case 0x3D:
-	_sdc1<EL>(inst, s);
-	break;
-      case 0x3F:
-	_sd<EL>(inst, s);
-	break;
-      default:
-	raise_ri(s, inst);
-	break;
-      }
-}
-
-/* ---- per-op handlers: each simple case body of exec_rtype / exec_itype, verbatim
- * (break -> return).  Cases with a nested switch or loop stay in the class handler. */
-template <bool EL>
-static void op_r00(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = static_cast<int32_t>(s->gpr[rt]) << sa;
-	s->pc += 4;
-	if(inst == 0) {
-	  HISTO(s, mipsInsn::NOP);
-	}
-	else {
-	  HISTO(s, mipsInsn::SLL);
-	}
-	return;
-}
-
-template <bool EL>
-static void op_r01(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	_movci(inst,s);
-	return;
-}
-
-template <bool EL>
-static void op_r02(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = sext64(((uint32_t)s->gpr[rt] >> sa));
-	s->pc += 4;
-	HISTO(s, mipsInsn::SRL);
-	return;
-}
-
-template <bool EL>
-static void op_r03(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = static_cast<int32_t>(s->gpr[rt]) >> sa;
-	s->pc += 4;
-	HISTO(s, mipsInsn::SRA);
-	return;	
-}
-
-template <bool EL>
-static void op_r04(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = sext64(static_cast<uint32_t>(s->gpr[rt]) << (s->gpr[rs] & 0x1f));
-	s->pc += 4;
-	HISTO(s, mipsInsn::SLLV);
-	return;
-}
-
-template <bool EL>
-static void op_r06(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = sext64((uint32_t)s->gpr[rt] >> (s->gpr[rs] & 0x1f));
-	s->pc += 4;
-	HISTO(s, mipsInsn::SRLV);
-	return;
-}
-
-template <bool EL>
-static void op_r07(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = static_cast<int32_t>(s->gpr[rt]) >> (s->gpr[rs] & 0x1f);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SRAV);
-	return;
-}
-
-template <bool EL>
-static void op_r08(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-{
-	state_t::reg_t jaddr = s->gpr[rs];
-	s->pc += 4;
-	if(!run_delay_slot<EL>(s))
-	  s->pc = jaddr;
-	HISTO(s, mipsInsn::JR);
-	return;
-      }
-}
-
-template <bool EL>
-static void op_r09(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-{
-	state_t::reg_t jaddr = s->gpr[rs];
-	if(rd != 0) {
-	  s->gpr[rd] = s->pc + 8;   /* full 64-bit link (n64 user PCs exceed 32 bits) */
-	}
-	s->pc += 4;
-	if(!run_delay_slot<EL>(s))
-	  s->pc = jaddr;
-	HISTO(s, mipsInsn::JALR);
-	return;
-      }
-}
-
-template <bool EL>
-static void op_r0c(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	raise_syscall(s);
-	HISTO(s, mipsInsn::BREAK);
-	return;
-}
-
-template <bool EL>
-static void op_r0d(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	raise_break(s);
-	HISTO(s, mipsInsn::BREAK);
-	return;
-}
-
-template <bool EL>
-static void op_r0f(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->pc += 4;
-	HISTO(s, mipsInsn::SYNC);
-	return;
-}
-
-template <bool EL>
-static void op_r10(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = s->hi;
-	s->pc += 4;
-	HISTO(s, mipsInsn::MFHI);
-	return;
-}
-
-template <bool EL>
-static void op_r11(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->hi = s->gpr[rs];
-	s->pc += 4;
-	HISTO(s, mipsInsn::MTHI);
-	return;
-}
-
-template <bool EL>
-static void op_r12(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = s->lo;
-	s->pc += 4;
-	HISTO(s, mipsInsn::MFLO);	
-	return;
-}
-
-template <bool EL>
-static void op_r13(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->lo = s->gpr[rs];
-	s->pc += 4;
-	HISTO(s, mipsInsn::MTLO);		
-	return;
-}
-
-template <bool EL>
-static void op_r18(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-{
-	int64_t y;
-	y = (int64_t)(int32_t)s->gpr[rs] * (int64_t)(int32_t)s->gpr[rt];
-	s->lo = (int32_t)(y & 0xffffffff);
-	s->hi = (int32_t)(y >> 32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::MULT);			
-	return;
-      }
-}
-
-template <bool EL>
-static void op_r19(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-{
-	uint64_t y;
-	uint64_t u0 = (uint64_t)(uint32_t)s->gpr[rs];
-	uint64_t u1 = (uint64_t)(uint32_t)s->gpr[rt];
-	y = u0*u1;
-	s->lo = sext64((uint32_t)y);
-	s->hi = sext64((uint32_t)(y>>32));
-	s->pc += 4;
-	HISTO(s, mipsInsn::MULTU);
-	return;
-      }
-}
-
-template <bool EL>
-static void op_r1a(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	if((int32_t)s->gpr[rt] != 0) {
-	  int64_t a = (int32_t)s->gpr[rs], b = (int32_t)s->gpr[rt];
-	  s->lo = sext64((uint32_t)(int32_t)(a / b));
-	  s->hi = sext64((uint32_t)(int32_t)(a % b));
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::DIV);
-	return;
-}
-
-template <bool EL>
-static void op_r1b(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	if(s->gpr[rt] != 0) {
-	  s->lo = sext64((uint32_t)s->gpr[rs] / (uint32_t)s->gpr[rt]);
-	  s->hi = sext64((uint32_t)s->gpr[rs] % (uint32_t)s->gpr[rt]);
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::DIVU);
-	return;
-}
-
-template <bool EL>
-static void op_r1c(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-{
-	__int128 y = (__int128)s->gpr[rs] * (__int128)s->gpr[rt];
-	s->lo = (int64_t)(y & 0xffffffffffffffffULL);
-	s->hi = (int64_t)(y >> 64);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DMULT);
-	return;
-      }
-}
-
-template <bool EL>
-static void op_r1d(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-{
-	unsigned __int128 y = (unsigned __int128)(uint64_t)s->gpr[rs]
-	                    * (unsigned __int128)(uint64_t)s->gpr[rt];
-	s->lo = (int64_t)(y & 0xffffffffffffffffULL);
-	s->hi = (int64_t)(uint64_t)(y >> 64);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DMULTU);
-	return;
-      }
-}
-
-template <bool EL>
-static void op_r1e(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	if(s->gpr[rt] != 0) {
-	  s->lo = s->gpr[rs] / s->gpr[rt];
-	  s->hi = s->gpr[rs] % s->gpr[rt];
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::DDIV);
-	return;
-}
-
-template <bool EL>
-static void op_r1f(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	if(s->gpr[rt] != 0) {
-	  s->lo = (int64_t)((uint64_t)s->gpr[rs] / (uint64_t)s->gpr[rt]);
-	  s->hi = (int64_t)((uint64_t)s->gpr[rs] % (uint64_t)s->gpr[rt]);
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::DDIVU);
-	return;
-}
-
-template <bool EL>
-static void op_r20(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-{
-	uint32_t u_rs = (uint32_t)s->gpr[rs];
-	uint32_t u_rt = (uint32_t)s->gpr[rt];
-	uint32_t result = u_rs + u_rt;
-	/* Overflow iff same-sign inputs produce different-sign result.
-	 * Matches RTL: w_add32_overflow = (result[31]!=rt[31]) & (rs[31]==rt[31]) */
-	if (((result >> 31) != (u_rt >> 31)) && ((u_rs >> 31) == (u_rt >> 31))) {
-	  raise_overflow(s);
-	  return;
-	}
-	s->gpr[rd] = sext64(result);
-	s->pc += 4;
-	HISTO(s, mipsInsn::ADD);
-	return;
-      }
-}
-
-template <bool EL>
-static void op_r21(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-{
-	uint32_t u_rs = (uint32_t)s->gpr[rs];
-	uint32_t u_rt = (uint32_t)s->gpr[rt];
-	s->gpr[rd] = sext64(u_rs + u_rt);
-	s->pc += 4;
-	HISTO(s, mipsInsn::ADDU);
-	return;
-      }
-}
-
-template <bool EL>
-static void op_r22(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-{
-	uint32_t u_rs = (uint32_t)s->gpr[rs];
-	uint32_t u_rt = (uint32_t)s->gpr[rt];
-	uint32_t result = u_rs - u_rt;
-	/* A-B overflows iff operands differ in sign AND result sign != rs (minuend).
-	 * Matches RTL: w_sub32_overflow = (result[31]!=rs[31]) & (rs[31]!=rt[31]) */
-	if (((result >> 31) != (u_rs >> 31)) && ((u_rs >> 31) != (u_rt >> 31))) {
-	  raise_overflow(s);
-	  return;
-	}
-	s->gpr[rd] = sext64(result);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SUB);
-	return;
-      }
-}
-
-template <bool EL>
-static void op_r23(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-{
-	uint32_t u_rs = (uint32_t)s->gpr[rs];
-	uint32_t u_rt = (uint32_t)s->gpr[rt];
-	uint32_t y = u_rs - u_rt;
-	s->gpr[rd] = sext64(y);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SUBU);
-	return;
-      }
-}
-
-template <bool EL>
-static void op_r24(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = s->gpr[rs] & s->gpr[rt];
-	s->pc += 4;
-	HISTO(s, mipsInsn::AND);
-	return;
-}
-
-template <bool EL>
-static void op_r25(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	if(rd != 0) {
-	  s->gpr[rd] = s->gpr[rs] | s->gpr[rt];
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::OR);
-	return;
-}
-
-template <bool EL>
-static void op_r26(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = s->gpr[rs] ^ s->gpr[rt];
-	s->pc += 4;
-	HISTO(s, mipsInsn::XOR);	
-	return;
-}
-
-template <bool EL>
-static void op_r27(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = ~(s->gpr[rs] | s->gpr[rt]);
-	s->pc += 4;
-	HISTO(s, mipsInsn::NOR);
-	return;
-}
-
-template <bool EL>
-static void op_r2a(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = s->gpr[rs] < s->gpr[rt];
-	s->pc += 4;
-	HISTO(s, mipsInsn::SLT);	
-	return;
-}
-
-template <bool EL>
-static void op_r2b(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-{
-	s->gpr[rd] = ((uint64_t)s->gpr[rs] < (uint64_t)s->gpr[rt]);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SLTU);
-	return;
-      }
-}
-
-template <bool EL>
-static void op_r0b(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = (s->gpr[rt] != 0) ? s->gpr[rs] : s->gpr[rd];
-	s->pc +=4;
-	HISTO(s, mipsInsn::MOVN);
-	return;
-}
-
-template <bool EL>
-static void op_r0a(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = (s->gpr[rt] == 0) ? s->gpr[rs] : s->gpr[rd];
-	s->pc += 4;
-	HISTO(s, mipsInsn::MOVZ);	
-	return;
-}
-
-template <bool EL>
-static void op_r30(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	if((int64_t)s->gpr[rs] >= (int64_t)s->gpr[rt]) { raise_trap(s); return; }
-	s->pc += 4; HISTO(s, mipsInsn::TGE); return;
-}
-
-template <bool EL>
-static void op_r31(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	if((uint64_t)s->gpr[rs] >= (uint64_t)s->gpr[rt]) { raise_trap(s); return; }
-	s->pc += 4; HISTO(s, mipsInsn::TGEU); return;
-}
-
-template <bool EL>
-static void op_r32(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	if((int64_t)s->gpr[rs] < (int64_t)s->gpr[rt]) { raise_trap(s); return; }
-	s->pc += 4; HISTO(s, mipsInsn::TLT); return;
-}
-
-template <bool EL>
-static void op_r33(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	if((uint64_t)s->gpr[rs] < (uint64_t)s->gpr[rt]) { raise_trap(s); return; }
-	s->pc += 4; HISTO(s, mipsInsn::TLTU); return;
-}
-
-template <bool EL>
-static void op_r34(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	if(s->gpr[rs] == s->gpr[rt]) {
-	  raise_trap(s);
-	  return;
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::TEQ);
-	return;
-}
-
-template <bool EL>
-static void op_r36(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	if(s->gpr[rs] != s->gpr[rt]) {
-	  raise_trap(s);
-	  return;
-	}
-	s->pc += 4;
-	HISTO(s, mipsInsn::TNE);
-	return;
-}
-
-template <bool EL>
-static void op_r2c(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-{
-	uint64_t u_rs = (uint64_t)s->gpr[rs];
-	uint64_t u_rt = (uint64_t)s->gpr[rt];
-	uint64_t result = u_rs + u_rt;
-	/* Matches RTL: w_add64_overflow = (result[63]!=rt[63]) & (rs[63]==rt[63]) */
-	if (((result >> 63) != (u_rt >> 63)) && ((u_rs >> 63) == (u_rt >> 63))) {
-	  raise_overflow(s);
-	  return;
-	}
-	s->gpr[rd] = (int64_t)result;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DADD);
-	return;
-      }
-}
-
-template <bool EL>
-static void op_r2d(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = s->gpr[rs] + s->gpr[rt];
-	s->pc += 4;
-	HISTO(s, mipsInsn::DADDU);
-	return;
-}
-
-template <bool EL>
-static void op_r2e(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-{
-	uint64_t u_rs = (uint64_t)s->gpr[rs];
-	uint64_t u_rt = (uint64_t)s->gpr[rt];
-	uint64_t result = u_rs - u_rt;
-	/* A-B overflows iff operands differ in sign AND result sign != rs (minuend).
-	 * Matches RTL: w_sub64_overflow = (result[63]!=rs[63]) & (rs[63]!=rt[63]) */
-	if (((result >> 63) != (u_rs >> 63)) && ((u_rs >> 63) != (u_rt >> 63))) {
-	  raise_overflow(s);
-	  return;
-	}
-	s->gpr[rd] = (int64_t)result;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSUB);
-	return;
-      }
-}
-
-template <bool EL>
-static void op_r2f(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = s->gpr[rs] - s->gpr[rt];
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSUBU);
-	return;
-}
-
-template <bool EL>
-static void op_r14(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = s->gpr[rt] << (s->gpr[rs] & 63);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSLLV);
-	return;
-}
-
-template <bool EL>
-static void op_r16(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = (int64_t)((uint64_t)s->gpr[rt] >> (s->gpr[rs] & 63));
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRLV);
-	return;
-}
-
-template <bool EL>
-static void op_r17(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = s->gpr[rt] >> (s->gpr[rs] & 63);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRAV);
-	return;
-}
-
-template <bool EL>
-static void op_r38(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = s->gpr[rt] << sa;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSLL);
-	return;
-}
-
-template <bool EL>
-static void op_r3a(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = (int64_t)((uint64_t)s->gpr[rt] >> sa);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRL);
-	return;
-}
-
-template <bool EL>
-static void op_r3b(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = s->gpr[rt] >> sa;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRA);
-	return;
-}
-
-template <bool EL>
-static void op_r3c(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = s->gpr[rt] << (sa + 32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSLL32);
-	return;
-}
-
-template <bool EL>
-static void op_r3e(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = (int64_t)((uint64_t)s->gpr[rt] >> (sa + 32));
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRL32);
-	return;
-}
-
-template <bool EL>
-static void op_r3f(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t funct = inst & 63; (void)funct;
-  uint32_t sa = (inst >> 6) & 31; (void)sa;
-	s->gpr[rd] = s->gpr[rt] >> (sa + 32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::DSRA32);
-	return;
-}
-
-template <bool EL>
-static void op_i08(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
-  int16_t simm16 = (int16_t)uimm32; (void)simm16;
-  int32_t simm32 = (int32_t)simm16; (void)simm32;
-  int32_t tmp = 0; (void)tmp;
-{
-	uint32_t u_rs  = (uint32_t)s->gpr[rs];
-	uint32_t u_imm = (uint32_t)simm32;
-	uint32_t result = u_rs + u_imm;
-	/* same rule as add (0x20): same-sign inputs, different-sign result */
-	if (((result >> 31) != (u_imm >> 31)) && ((u_rs >> 31) == (u_imm >> 31))) {
-	  raise_overflow(s);
-	  return;
-	}
-	s->gpr[rt] = sext64(result);
-	s->pc+=4;
-	HISTO(s, mipsInsn::ADDI);
-	return;
-      }
-}
-
-template <bool EL>
-static void op_i09(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
-  int16_t simm16 = (int16_t)uimm32; (void)simm16;
-  int32_t simm32 = (int32_t)simm16; (void)simm32;
-  int32_t tmp = 0; (void)tmp;
-	tmp = sext64((uint32_t)(s->gpr[rs] + simm32));
-	s->gpr[rt] = tmp;
-	s->pc+=4;
-	HISTO(s, mipsInsn::ADDIU);
-	return;
-}
-
-template <bool EL>
-static void op_i0a(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
-  int16_t simm16 = (int16_t)uimm32; (void)simm16;
-  int32_t simm32 = (int32_t)simm16; (void)simm32;
-  int32_t tmp = 0; (void)tmp;
-	s->gpr[rt] = (s->gpr[rs] < simm32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SLTI);
-	return;
-}
-
-template <bool EL>
-static void op_i0b(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
-  int16_t simm16 = (int16_t)uimm32; (void)simm16;
-  int32_t simm32 = (int32_t)simm16; (void)simm32;
-  int32_t tmp = 0; (void)tmp;
-	s->gpr[rt] = ((uint64_t)s->gpr[rs] < (uint64_t)(int64_t)simm32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::SLTIU);
-	return;
-}
-
-template <bool EL>
-static void op_i0c(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
-  int16_t simm16 = (int16_t)uimm32; (void)simm16;
-  int32_t simm32 = (int32_t)simm16; (void)simm32;
-  int32_t tmp = 0; (void)tmp;
-	s->gpr[rt] = s->gpr[rs] & uimm32;
-	s->pc += 4;
-	HISTO(s, mipsInsn::ANDI);
-	return;
-}
-
-template <bool EL>
-static void op_i0d(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
-  int16_t simm16 = (int16_t)uimm32; (void)simm16;
-  int32_t simm32 = (int32_t)simm16; (void)simm32;
-  int32_t tmp = 0; (void)tmp;
-	s->gpr[rt] = s->gpr[rs] | uimm32;
-	s->pc += 4;
-	HISTO(s, mipsInsn::ORI);
-	return;
-}
-
-template <bool EL>
-static void op_i0e(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
-  int16_t simm16 = (int16_t)uimm32; (void)simm16;
-  int32_t simm32 = (int32_t)simm16; (void)simm32;
-  int32_t tmp = 0; (void)tmp;
-	s->gpr[rt] = s->gpr[rs] ^ uimm32;
-	s->pc += 4;
-	HISTO(s, mipsInsn::XORI);
-	return;
-}
-
-template <bool EL>
-static void op_i0f(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
-  int16_t simm16 = (int16_t)uimm32; (void)simm16;
-  int32_t simm32 = (int32_t)simm16; (void)simm32;
-  int32_t tmp = 0; (void)tmp;
-	uimm32 <<= 16;
-	s->gpr[rt] = sext64(uimm32);
-	s->pc += 4;
-	HISTO(s, mipsInsn::LUI);
-	return;
-}
-
-template <bool EL>
-static void op_i18(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
-  int16_t simm16 = (int16_t)uimm32; (void)simm16;
-  int32_t simm32 = (int32_t)simm16; (void)simm32;
-  int32_t tmp = 0; (void)tmp;
-{
-	uint64_t u_rs  = (uint64_t)s->gpr[rs];
-	uint64_t u_imm = (uint64_t)(int64_t)simm32;   /* sign-extend imm to 64 bits */
-	uint64_t result = u_rs + u_imm;
-	/* same overflow rule as dadd (0x2C): same-sign inputs, different-sign result */
-	if (((result >> 63) != (u_imm >> 63)) && ((u_rs >> 63) == (u_imm >> 63))) {
-	  raise_overflow(s);
-	  return;
-	}
-	s->gpr[rt] = (int64_t)result;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DADDI);
-	return;
-      }
-}
-
-template <bool EL>
-static void op_i19(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
-  int16_t simm16 = (int16_t)uimm32; (void)simm16;
-  int32_t simm32 = (int32_t)simm16; (void)simm32;
-  int32_t tmp = 0; (void)tmp;
-	s->gpr[rt] = s->gpr[rs] + simm32;
-	s->pc += 4;
-	HISTO(s, mipsInsn::DADDIU);
-	return;
-}
-
-template <bool EL>
-static void op_i27(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
-  int16_t simm16 = (int16_t)uimm32; (void)simm16;
-  int32_t simm32 = (int32_t)simm16; (void)simm32;
-  int32_t tmp = 0; (void)tmp;
-{
-	uint32_t rs_ = (inst >> 21) & 31;
-	uint32_t rt_ = (inst >> 16) & 31;
-	int32_t imm  = (int32_t)(int16_t)(inst & 0xffffu);
-	uint32_t ea  = va_translate(s, s->gpr[rs_] + imm, tlb_op::load);
-	if(s->tlb_fault) return;
-	if(ea & 3) { raise_adel(s); return; }
-	s->gpr[rt_] = (uint64_t)(uint32_t)bswap<EL>(s->mem.get<int32_t>(ea));
-	s->pc += 4;
-	HISTO(s, mipsInsn::LWU);
-	return;
-      }
-}
-
-template <bool EL>
-static void op_i33(uint32_t inst, state_t *s) {
-  sparse_mem &mem = s->mem; (void)mem;
-  uint32_t opcode = inst>>26; (void)opcode;
-  uint32_t rs = (inst >> 21) & 31; (void)rs;
-  uint32_t rt = (inst >> 16) & 31; (void)rt;
-  uint32_t rd = (inst >> 11) & 31; (void)rd;
-  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
-  int16_t simm16 = (int16_t)uimm32; (void)simm16;
-  int32_t simm32 = (int32_t)simm16; (void)simm32;
-  int32_t tmp = 0; (void)tmp;
-	s->pc += 4;
-	return;
-}
-
-/* raw instruction word -> handler.  Every check exec_generic does before dispatch is a
- * static property of the word except its mode/CU1 test, so words that need one keep
- * going through exec_generic; the rest go straight to their class or op handler. */
-template <bool EL>
-static dinst_fn_t decode_insn(uint32_t inst) {
-  const uint32_t op = inst >> 26, fn = inst & 0x3fu;
-  if(is_64b_gated(inst)) {
-    return exec_generic<EL>;                       /* needs the 64-bit-mode check */
-  }
-  if(op == 0x11 || op == 0x13 || op == 0x31 || op == 0x35 || op == 0x39 || op == 0x3d) {
-    return exec_generic<EL>;                       /* CU1 check (and COP1X's MIPS IV RI) */
-  }
-  if(op == 0 && (fn == 0x01 || fn == 0x0a || fn == 0x0b)) {
-    return exec_generic<EL>;                       /* movci/movz/movn: MIPS IV RI */
-  }
-  if(op == 0) {
-    switch(fn)
-      {
-      case 0x00: return op_r00<EL>;
-      case 0x01: return op_r01<EL>;
-      case 0x02: return op_r02<EL>;
-      case 0x03: return op_r03<EL>;
-      case 0x04: return op_r04<EL>;
-      case 0x06: return op_r06<EL>;
-      case 0x07: return op_r07<EL>;
-      case 0x08: return op_r08<EL>;
-      case 0x09: return op_r09<EL>;
-      case 0x0a: return op_r0a<EL>;
-      case 0x0b: return op_r0b<EL>;
-      case 0x0c: return op_r0c<EL>;
-      case 0x0d: return op_r0d<EL>;
-      case 0x0f: return op_r0f<EL>;
-      case 0x10: return op_r10<EL>;
-      case 0x11: return op_r11<EL>;
-      case 0x12: return op_r12<EL>;
-      case 0x13: return op_r13<EL>;
-      case 0x14: return op_r14<EL>;
-      case 0x16: return op_r16<EL>;
-      case 0x17: return op_r17<EL>;
-      case 0x18: return op_r18<EL>;
-      case 0x19: return op_r19<EL>;
-      case 0x1a: return op_r1a<EL>;
-      case 0x1b: return op_r1b<EL>;
-      case 0x1c: return op_r1c<EL>;
-      case 0x1d: return op_r1d<EL>;
-      case 0x1e: return op_r1e<EL>;
-      case 0x1f: return op_r1f<EL>;
-      case 0x20: return op_r20<EL>;
-      case 0x21: return op_r21<EL>;
-      case 0x22: return op_r22<EL>;
-      case 0x23: return op_r23<EL>;
-      case 0x24: return op_r24<EL>;
-      case 0x25: return op_r25<EL>;
-      case 0x26: return op_r26<EL>;
-      case 0x27: return op_r27<EL>;
-      case 0x2a: return op_r2a<EL>;
-      case 0x2b: return op_r2b<EL>;
-      case 0x2c: return op_r2c<EL>;
-      case 0x2d: return op_r2d<EL>;
-      case 0x2e: return op_r2e<EL>;
-      case 0x2f: return op_r2f<EL>;
-      case 0x30: return op_r30<EL>;
-      case 0x31: return op_r31<EL>;
-      case 0x32: return op_r32<EL>;
-      case 0x33: return op_r33<EL>;
-      case 0x34: return op_r34<EL>;
-      case 0x36: return op_r36<EL>;
-      case 0x38: return op_r38<EL>;
-      case 0x3a: return op_r3a<EL>;
-      case 0x3b: return op_r3b<EL>;
-      case 0x3c: return op_r3c<EL>;
-      case 0x3e: return op_r3e<EL>;
-      case 0x3f: return op_r3f<EL>;
+      case 0x400: return s->mmu_far;
       default: break;
       }
-    return exec_rtype<EL>;
   }
-  if(op == 0x02 || op == 0x03) {
-    return exec_jtype<EL>;
+  if(not asi_is_viking_cache(asi)) {
+    fprintf(stderr, "ISS: load from unmodeled asi 0x%x va 0x%x pc 0x%x\n", asi, va, s->pc);
   }
-  if(op == 0x10 || op == 0x12 || op == 0x1c || op == 0x1f || op == 0x30 || op == 0x38 ||
-     op == 0x34 || op == 0x3c) {
-    return exec_generic<EL>;                       /* COP0/COP2/SPECIAL2/3, LL/SC/LLD/SCD */
+  return 0;
+}
+
+static void asi_store(state_t *s, uint32_t asi, uint32_t va, uint32_t v) {
+  if(asi == 0x2 and va >= 0x01c00000 and va < 0x01c00020) {
+    uint64_t &d = s->mxccdata[(va >> 3) & 3];
+    d = (va & 4) ? ((d & 0xffffffff00000000ULL) | v) : ((d & 0xffffffffULL) | (static_cast<uint64_t>(v) << 32));
+    return;
   }
+  if(asi == 0x2 and (va & ~4u) == 0x01c00100) {
+    /* stream source: the register is 64 bits (the high word first); the copy
+     * runs when the low word, which holds the physical address, lands */
+    if(va & 4) {
+      for(uint32_t i = 0; i < 4; i++) {
+	uint64_t pa = v + 8 * i;
+	s->mxccdata[i] = (static_cast<uint64_t>(ld_phys<uint32_t>(s, pa)) << 32) | ld_phys<uint32_t>(s, pa + 4);
+      }
+    }
+    return;
+  }
+  if(asi == 0x2 and (va & ~4u) == 0x01c00200) {
+    if(va & 4) {
+      for(uint32_t i = 0; i < 4; i++) {
+	uint64_t pa = v + 8 * i;
+	st_phys<uint32_t>(s, pa, static_cast<uint32_t>(s->mxccdata[i] >> 32));
+	st_phys<uint32_t>(s, pa + 4, static_cast<uint32_t>(s->mxccdata[i]));
+      }
+    }
+    return;
+  }
+  if(asi == 0x2 and mxcc_reg(va) >= 0) {
+    int r = mxcc_reg(va);
+    uint64_t m = (va & 4) ? 0xffffffffULL : 0xffffffff00000000ULL;
+    uint64_t w = (va & 4) ? v : (static_cast<uint64_t>(v) << 32);
+    if(r == 6) {             /* error register: writing 1 clears the bit */
+      s->mxcc[6] &= ~(w & m);
+    }
+    else {
+      s->mxcc[r] = (s->mxcc[r] & ~m) | w;
+    }
+    return;
+  }
+  if(asi == 0x3) {          /* TLB flush: there is no TLB */
+    return;
+  }
+  if(asi == 0x4) {
+    switch(va & 0xf00)
+      {
+      case 0x000: s->mmu_ctrl = v & 0x00ffffffu; return;   /* impl/ver read 0 */
+      case 0x100: s->mmu_ctpr = v & ~3u; return;
+      case 0x200: s->mmu_ctx = v & 0xffff; return;
+      case 0x300: case 0x400: return;
+      default: break;
+      }
+  }
+  if(not asi_is_viking_cache(asi)) {
+    fprintf(stderr, "ISS: store to unmodeled asi 0x%x va 0x%x pc 0x%x\n", asi, va, s->pc);
+  }
+}
+
+/* user-emulation helpers (emu_spill/fill/syscall): MMU off there, so no faults */
+template <typename T>
+static T ld_mem(state_t *s, uint32_t asi, uint32_t va) {
+  uint64_t pa = 0;
+  uint32_t ft = mmu_xlate(s, asi, va, acc_t::load, &pa);
+  assert(ft == FT_NONE);
+  return ld_phys<T>(s, pa);
+}
+
+template <typename T>
+static void st_mem(state_t *s, uint32_t asi, uint32_t va, T v) {
+  uint64_t pa = 0;
+  uint32_t ft = mmu_xlate(s, asi, va, acc_t::store, &pa);
+  assert(ft == FT_NONE);
+  st_phys<T>(s, pa, v);
+}
+
+/* ---------------------------------------------------------------- traps */
+
+static void take_trap(state_t *s, uint32_t tt) {
+  s->last_tt = tt;
+  s->ntraps++;
+  if(s->user_emu) {
+    fprintf(stderr, "ISS: unhandled trap tt 0x%x at pc 0x%x (user emulation)\n", tt, s->pc);
+    s->brk = true;
+    s->exit_code = -1;
+    return;
+  }
+  if(not s->et) {
+    /* a trap with ET=0 enters error mode (on sun4m the watchdog then resets) */
+    fprintf(stderr, "ISS: error mode, tt 0x%x at pc 0x%x\n", tt, s->pc);
+    s->error_mode = true;
+    s->brk = true;
+    return;
+  }
+  s->et = false;
+  s->ps = s->s;
+  s->s = true;
+  s->cwp = (s->cwp + NWINDOWS - 1) % NWINDOWS;
+  s->gpr(17) = s->pc;    /* %l1 */
+  s->gpr(18) = s->npc;   /* %l2 */
+  s->tbr = (s->tbr & 0xfffff000u) | ((tt & 0xff) << 4);
+  s->pc = s->tbr;
+  s->npc = s->tbr + 4;
+}
+
+/* --user: the Linux kernel's window spill/fill, done inline instead of trapping.
+ *
+ * SAVE at CWP=C found WIM[C-1] set.  The valid windows are C..C-2 (newest to
+ * oldest); the invalid window C-1's outs hold the oldest window's ins.  Spill the
+ * oldest window (C-2): its locals+ins go to its own %sp (= its %o6).  C-2 becomes
+ * the invalid window. */
+static void emu_spill(state_t *s) {
+  uint32_t w = (s->cwp + NWINDOWS - 2) % NWINDOWS;
+  uint32_t sp = s->r[widx(w, 14)];
+  for(uint32_t i = 0; i < 16; i++) {
+    st_mem<uint32_t>(s, 0xa, sp + 4*i, s->r[widx(w, 16 + i)]);
+  }
+  s->wim = 1u << w;
+}
+
+/* RESTORE at CWP=C found WIM[C+1] set: reload the caller window C+1's locals+ins
+ * from its %sp (= our %fp; its outs alias our ins and are live), then C+2 is the
+ * invalid window. */
+static void emu_fill(state_t *s) {
+  uint32_t w = (s->cwp + 1) % NWINDOWS;
+  uint32_t sp = s->r[widx(w, 14)];
+  for(uint32_t i = 0; i < 16; i++) {
+    s->r[widx(w, 16 + i)] = ld_mem<uint32_t>(s, 0xa, sp + 4*i);
+  }
+  s->wim = 1u << ((s->cwp + 2) % NWINDOWS);
+}
+
+/* --user: Linux sparc32 syscall ABI.  ta 0x10, number in %g1, args in %o0-%o5,
+ * result in %o0, icc.C set on error (with a positive errno in %o0).  The kernel
+ * returns to nPC. */
+static void emu_syscall(state_t *s) {
+  static const uint32_t SPARC_ENOSYS = 90;
+  uint32_t num = s->gpr(1);
+  uint32_t a0 = s->gpr(8), a1 = s->gpr(9), a2 = s->gpr(10);
+  int64_t rc = 0;
+  switch(num)
+    {
+    case 1:     /* exit */
+    case 188:   /* exit_group */
+      s->brk = true;
+      s->exit_code = static_cast<int32_t>(a0);
+      break;
+    case 4: {   /* write */
+      FILE *fp = (a0 == 2) ? stderr : stdout;
+      for(uint32_t i = 0; i < a2; i++) {
+	fputc(ld_mem<uint8_t>(s, 0xa, a1 + i), fp);
+      }
+      fflush(fp);
+      rc = a2;
+      break;
+    }
+    default:
+      fprintf(stderr, "ISS: unimplemented syscall %u at pc 0x%x\n", num, s->pc);
+      rc = -static_cast<int64_t>(SPARC_ENOSYS);
+      break;
+    }
+  if(rc < 0) {
+    s->gpr(8) = static_cast<uint32_t>(-rc);
+    s->icc_c = true;
+  }
+  else {
+    s->gpr(8) = static_cast<uint32_t>(rc);
+    s->icc_c = false;
+  }
+  s->pc = s->npc;
+  s->npc = s->npc + 4;
+}
+
+/* ---------------------------------------------------------------- integer helpers */
+
+static inline void set_nz(state_t *s, uint32_t res) {
+  s->icc_n = (res >> 31) & 1;
+  s->icc_z = (res == 0);
+}
+
+static inline uint32_t add_cc(state_t *s, uint32_t a, uint32_t b, uint32_t cin) {
+  uint64_t sum = static_cast<uint64_t>(a) + b + cin;
+  uint32_t res = static_cast<uint32_t>(sum);
+  set_nz(s, res);
+  s->icc_v = (((~(a ^ b)) & (a ^ res)) >> 31) & 1;
+  s->icc_c = (sum >> 32) & 1;
+  return res;
+}
+
+static inline uint32_t sub_cc(state_t *s, uint32_t a, uint32_t b, uint32_t cin) {
+  uint64_t diff = static_cast<uint64_t>(a) - b - cin;
+  uint32_t res = static_cast<uint32_t>(diff);
+  set_nz(s, res);
+  s->icc_v = (((a ^ b) & (a ^ res)) >> 31) & 1;
+  s->icc_c = (diff >> 32) & 1;   /* borrow */
+  return res;
+}
+
+static bool eval_icc(const state_t *s, uint32_t cond) {
+  bool r = false;
+  switch(cond & 7)
+    {
+    case 0: r = false; break;                                 /* bn   */
+    case 1: r = s->icc_z; break;                              /* be   */
+    case 2: r = s->icc_z or (s->icc_n != s->icc_v); break;    /* ble  */
+    case 3: r = (s->icc_n != s->icc_v); break;                /* bl   */
+    case 4: r = s->icc_c or s->icc_z; break;                  /* bleu */
+    case 5: r = s->icc_c; break;                              /* bcs  */
+    case 6: r = s->icc_n; break;                              /* bneg */
+    case 7: r = s->icc_v; break;                              /* bvs  */
+    }
+  /* conds 8..15 are the complements of 0..7 (ba, bne, bg, ...) */
+  return (cond & 8) ? not r : r;
+}
+
+/* fcc: 0 '=', 1 '<', 2 '>', 3 unordered.  Bit k of the mask set => taken when fcc==k. */
+static bool eval_fcc(uint32_t fcc, uint32_t cond) {
+  static const uint8_t mask[16] = {
+    0x0, 0xe, 0x6, 0xa, 0x2, 0xc, 0x4, 0x8,
+    0xf, 0x1, 0x9, 0x5, 0xd, 0x3, 0xb, 0x7
+  };
+  return (mask[cond & 15] >> fcc) & 1;
+}
+
+/* ---------------------------------------------------------------- FPU */
+
+static inline float  as_f(uint32_t x) { float f; memcpy(&f, &x, 4); return f; }
+static inline uint32_t as_u(float f) { uint32_t x; memcpy(&x, &f, 4); return x; }
+static inline double as_d(uint64_t x) { double d; memcpy(&d, &x, 8); return d; }
+static inline uint64_t as_u(double d) { uint64_t x; memcpy(&x, &d, 8); return x; }
+
+static inline bool nan32(uint32_t x) { return ((x >> 23) & 0xff) == 0xff and (x & 0x7fffff); }
+static inline bool snan32(uint32_t x) { return nan32(x) and not (x & 0x400000); }
+static inline bool nan64(uint64_t x) { return ((x >> 52) & 0x7ff) == 0x7ff and (x & 0xfffffffffffffULL); }
+static inline bool snan64(uint64_t x) { return nan64(x) and not (x & 0x8000000000000ULL); }
+
+static const uint32_t DEFAULT_NAN32 = 0x7fffffffu;
+static const uint64_t DEFAULT_NAN64 = 0x7fffffffffffffffULL;
+
+/* SPARC NaN propagation: an SNaN in rs2, else an SNaN in rs1, else a QNaN in
+ * rs2, else rs1 -- quieted.  (x86 prefers the first operand, so this is done
+ * explicitly rather than trusting the host.) */
+static uint32_t pick_nan32(uint32_t a, uint32_t b) {
+  if(snan32(b)) {
+    return b | 0x400000;
+  }
+  if(snan32(a)) {
+    return a | 0x400000;
+  }
+  return nan32(b) ? b : a;
+}
+
+static uint64_t pick_nan64(uint64_t a, uint64_t b) {
+  if(snan64(b)) {
+    return b | 0x8000000000000ULL;
+  }
+  if(snan64(a)) {
+    return a | 0x8000000000000ULL;
+  }
+  return nan64(b) ? b : a;
+}
+
+/* use only where the inputs were not NaN: then a NaN result came from an invalid
+ * op, and SPARC produces its default NaN rather than the x86 one */
+static inline uint32_t def_nan32(uint32_t r) { return nan32(r) ? DEFAULT_NAN32 : r; }
+static inline uint64_t def_nan64(uint64_t r) { return nan64(r) ? DEFAULT_NAN64 : r; }
+
+static inline uint64_t get_d(const state_t *s, uint32_t r) {
+  r &= ~1u;   /* odd double reg: low bit ignored (hardware behavior, matches qemu) */
+  return (static_cast<uint64_t>(s->f[r]) << 32) | s->f[r + 1];
+}
+
+static inline void set_d(state_t *s, uint32_t r, uint64_t v) {
+  r &= ~1u;
+  s->f[r] = static_cast<uint32_t>(v >> 32);
+  s->f[r + 1] = static_cast<uint32_t>(v);
+}
+
+static void fp_set_round(uint32_t fsr) {
+  static const int modes[4] = {FE_TONEAREST, FE_TOWARDZERO, FE_UPWARD, FE_DOWNWARD};
+  fesetround(modes[(fsr >> FSR_RD_SHIFT) & 3]);
+}
+
+static uint32_t host_exc() {
+  int e = fetestexcept(FE_ALL_EXCEPT);
+  uint32_t r = 0;
+  if(e & FE_INEXACT)   { r |= FEXC_NX; }
+  if(e & FE_DIVBYZERO) { r |= FEXC_DZ; }
+  if(e & FE_UNDERFLOW) { r |= FEXC_UF; }
+  if(e & FE_OVERFLOW)  { r |= FEXC_OF; }
+  if(e & FE_INVALID)   { r |= FEXC_NV; }
+  return r;
+}
+
+static inline void set_ftt(state_t *s, uint32_t ftt) {
+  s->fsr = (s->fsr & ~(7u << FSR_FTT_SHIFT)) | (ftt << FSR_FTT_SHIFT);
+}
+
+static uint32_t fp_unimp(state_t *s, uint32_t pc, uint32_t inst) {
+  set_ftt(s, FTT_UNIMP);
+  s->fq_addr = pc;
+  s->fq_insn = inst;
+  s->fsr |= FSR_QNE;
+  return TT_FP_EXCEPTION;
+}
+
+/* float -> int32 (fstoi/fdtoi always round toward zero).  NaN and positive
+ * overflow give 0x7fffffff, negative overflow 0x80000000, all with NV. */
+static uint32_t f2i(double v, uint32_t *exc) {
+  if(std::isnan(v) or v >= 2147483648.0) {
+    *exc |= FEXC_NV;
+    return 0x7fffffffu;
+  }
+  if(v <= -2147483649.0) {
+    *exc |= FEXC_NV;
+    return 0x80000000u;
+  }
+  double t = std::trunc(v);
+  if(t != v) {
+    *exc |= FEXC_NX;
+  }
+  return static_cast<uint32_t>(static_cast<int32_t>(t));
+}
+
+/* FPop1 / FPop2.  Traps are precise: the trapping FPop is the one in FQ and at
+ * the trap PC.
+ *
+ * TODO(co-sim): x86 detects tininess after rounding; if the RTL FPU detects it
+ * before rounding, UF can differ on results right at the denormal boundary. */
+static uint32_t exec_fpop(state_t *s, uint32_t pc, uint32_t inst, bool fpop2) {
+  uint32_t rd = (inst >> 25) & 31;
+  uint32_t rs1 = (inst >> 14) & 31;
+  uint32_t rs2 = inst & 31;
+  uint32_t opf = (inst >> 5) & 0x1ff;
+
+  enum class dst_t { none, s, d, fcc };
+  dst_t dst = dst_t::none;
+  uint32_t r32 = 0;
+  uint64_t r64 = 0;
+  uint32_t exc = 0;
+
+  fp_set_round(s->fsr);
+  feclearexcept(FE_ALL_EXCEPT);
+
+  uint32_t a32 = s->f[rs1], b32 = s->f[rs2];
+  uint64_t a64 = get_d(s, rs1), b64 = get_d(s, rs2);
+
+  if(fpop2) {
+    bool is_e = false;
+    bool is_d = false;
+    switch(opf)
+      {
+      case 0x051: break;                            /* fcmps  */
+      case 0x052: is_d = true; break;               /* fcmpd  */
+      case 0x055: is_e = true; break;               /* fcmpes */
+      case 0x056: is_e = true; is_d = true; break;  /* fcmped */
+      default:
+	return fp_unimp(s, pc, inst);                 /* quad + reserved */
+      }
+    bool unord = is_d ? (nan64(a64) or nan64(b64)) : (nan32(a32) or nan32(b32));
+    bool sig = is_d ? (snan64(a64) or snan64(b64)) : (snan32(a32) or snan32(b32));
+    if(sig or (is_e and unord)) {
+      exc |= FEXC_NV;
+    }
+    if(unord) {
+      r32 = 3;
+    }
+    else {
+      double x = is_d ? as_d(a64) : as_f(a32);
+      double y = is_d ? as_d(b64) : as_f(b32);
+      r32 = (x == y) ? 0 : ((x < y) ? 1 : 2);
+    }
+    dst = dst_t::fcc;
+  }
+  else {
+    switch(opf)
+      {
+      case 0x001: r32 = b32; dst = dst_t::s; break;                    /* fmovs */
+      case 0x005: r32 = b32 ^ 0x80000000u; dst = dst_t::s; break;      /* fnegs */
+      case 0x009: r32 = b32 & 0x7fffffffu; dst = dst_t::s; break;      /* fabss */
+      case 0x029:                                                       /* fsqrts */
+	if(nan32(b32)) {
+	  r32 = pick_nan32(b32, b32);
+	  exc |= snan32(b32) ? FEXC_NV : 0;
+	}
+	else {
+	  volatile float x = as_f(b32);
+	  r32 = def_nan32(as_u(std::sqrt(x)));
+	  exc |= host_exc();
+	}
+	dst = dst_t::s;
+	break;
+      case 0x02a:                                                       /* fsqrtd */
+	if(nan64(b64)) {
+	  r64 = pick_nan64(b64, b64);
+	  exc |= snan64(b64) ? FEXC_NV : 0;
+	}
+	else {
+	  volatile double x = as_d(b64);
+	  r64 = def_nan64(as_u(std::sqrt(x)));
+	  exc |= host_exc();
+	}
+	dst = dst_t::d;
+	break;
+      case 0x041: case 0x045: case 0x049: case 0x04d:                   /* fadds fsubs fmuls fdivs */
+	if(nan32(a32) or nan32(b32)) {
+	  r32 = pick_nan32(a32, b32);
+	  exc |= (snan32(a32) or snan32(b32)) ? FEXC_NV : 0;
+	}
+	else {
+	  volatile float x = as_f(a32), y = as_f(b32);
+	  float z = (opf == 0x041) ? x + y : (opf == 0x045) ? x - y : (opf == 0x049) ? x * y : x / y;
+	  r32 = def_nan32(as_u(z));
+	  exc |= host_exc();
+	}
+	dst = dst_t::s;
+	break;
+      case 0x042: case 0x046: case 0x04a: case 0x04e:                   /* faddd fsubd fmuld fdivd */
+	if(nan64(a64) or nan64(b64)) {
+	  r64 = pick_nan64(a64, b64);
+	  exc |= (snan64(a64) or snan64(b64)) ? FEXC_NV : 0;
+	}
+	else {
+	  volatile double x = as_d(a64), y = as_d(b64);
+	  double z = (opf == 0x042) ? x + y : (opf == 0x046) ? x - y : (opf == 0x04a) ? x * y : x / y;
+	  r64 = def_nan64(as_u(z));
+	  exc |= host_exc();
+	}
+	dst = dst_t::d;
+	break;
+      case 0x069:                                                       /* fsmuld (exact) */
+	if(nan32(a32) or nan32(b32)) {
+	  volatile float n = as_f(pick_nan32(a32, b32));
+	  r64 = as_u(static_cast<double>(n));
+	  exc |= (snan32(a32) or snan32(b32)) ? FEXC_NV : 0;
+	}
+	else {
+	  volatile double x = as_f(a32), y = as_f(b32);
+	  r64 = def_nan64(as_u(x * y));
+	  exc |= host_exc();
+	}
+	dst = dst_t::d;
+	break;
+      case 0x0c4: {                                                     /* fitos */
+	volatile int32_t x = static_cast<int32_t>(b32);
+	r32 = as_u(static_cast<float>(x));
+	exc |= host_exc();
+	dst = dst_t::s;
+	break;
+      }
+      case 0x0c8: {                                                     /* fitod (exact) */
+	volatile int32_t x = static_cast<int32_t>(b32);
+	r64 = as_u(static_cast<double>(x));
+	dst = dst_t::d;
+	break;
+      }
+      case 0x0c9: {                                                     /* fstod */
+	/* the host widen quiets an SNaN, keeps the payload and raises NV: same as V8 */
+	volatile float x = as_f(b32);
+	r64 = as_u(static_cast<double>(x));
+	exc |= host_exc();
+	dst = dst_t::d;
+	break;
+      }
+      case 0x0c6: {                                                     /* fdtos */
+	volatile double x = as_d(b64);
+	r32 = as_u(static_cast<float>(x));
+	exc |= host_exc();
+	dst = dst_t::s;
+	break;
+      }
+      case 0x0d1:                                                       /* fstoi */
+	r32 = f2i(as_f(b32), &exc);
+	dst = dst_t::s;
+	break;
+      case 0x0d2:                                                       /* fdtoi */
+	r32 = f2i(as_d(b64), &exc);
+	dst = dst_t::s;
+	break;
+      default:
+	return fp_unimp(s, pc, inst);                                   /* quad + reserved */
+      }
+  }
+
+  uint32_t tem = (s->fsr >> FSR_TEM_SHIFT) & 0x1f;
+  s->fsr = (s->fsr & ~0x1fu) | exc;   /* cexc */
+  if(exc & tem) {
+    /* IEEE trap: cexc updated, aexc and the destination untouched */
+    set_ftt(s, FTT_IEEE);
+    s->fq_addr = pc;
+    s->fq_insn = inst;
+    s->fsr |= FSR_QNE;
+    return TT_FP_EXCEPTION;
+  }
+  set_ftt(s, 0);
+  s->fsr |= exc << FSR_AEXC_SHIFT;
+  switch(dst)
+    {
+    case dst_t::s:
+      s->f[rd] = r32;
+      break;
+    case dst_t::d:
+      set_d(s, rd, r64);
+      break;
+    case dst_t::fcc:
+      s->fsr = (s->fsr & ~(3u << FSR_FCC_SHIFT)) | (r32 << FSR_FCC_SHIFT);
+      break;
+    default:
+      break;
+    }
+  return NO_TRAP;
+}
+
+/* ---------------------------------------------------------------- execute */
+
+void take_interrupt(state_t *s, uint32_t level) {
+  take_trap(s, TT_INTERRUPT_BASE + level);
+}
+
+void execSparc(state_t *s) {
+  if(not s->ext_irq and s->et and s->irl != 0 and (s->irl == 15 or s->irl > s->pil)) {
+    take_trap(s, TT_INTERRUPT_BASE + s->irl);
+    return;
+  }
+
+  const uint32_t pc = s->pc;
+  const uint32_t npc = s->npc;
+  uint64_t fetch_pa = 0;
+  if(mmu_xlate(s, s->s ? 0x9 : 0x8, pc, acc_t::fetch, &fetch_pa) != FT_NONE) {
+    take_trap(s, TT_IACCESS);
+    return;
+  }
+  const uint32_t inst = ld_phys<uint32_t>(s, fetch_pa);
+  if(s->bus_error and mmu_bus_error(s, fetch_pa, false, true, false)) {
+    take_trap(s, TT_IACCESS_ERROR);
+    return;
+  }
+
+  uint32_t new_pc = npc;
+  uint32_t new_npc = npc + 4;
+  uint32_t trap = NO_TRAP;
+
+  const uint32_t op = inst >> 30;
+  const uint32_t rd = (inst >> 25) & 31;
+  const uint32_t op3 = (inst >> 19) & 63;
+  const uint32_t rs1 = (inst >> 14) & 31;
+  const bool imm = (inst >> 13) & 1;
+  const uint32_t simm13 = static_cast<uint32_t>(static_cast<int32_t>(inst << 19) >> 19);
+
+  /* writes to %g0 are discarded */
+  auto wr = [&](uint32_t r, uint32_t v) {
+    if(r != 0) {
+      s->gpr(r) = v;
+    }
+  };
+
   switch(op)
     {
-  case 0x01: return _bgez_bltz<EL>;
-  case 0x04: return branch<EL,branch_type::beq>;
-  case 0x05: return branch<EL,branch_type::bne>;
-  case 0x06: return branch<EL,branch_type::blez>;
-  case 0x07: return branch<EL,branch_type::bgtz>;
-  case 0x14: return branch<EL,branch_type::beql>;
-  case 0x15: return branch<EL,branch_type::bnel>;
-  case 0x16: return branch<EL,branch_type::blezl>;
-  case 0x17: return branch<EL,branch_type::bgtzl>;
-  case 0x1a: return _ldl<EL>;
-  case 0x1b: return _ldr<EL>;
-  case 0x20: return _lb;
-  case 0x21: return _lh<EL>;
-  case 0x22: return _lwl<EL>;
-  case 0x23: return _lw<EL>;
-  case 0x24: return _lbu;
-  case 0x25: return _lhu<EL>;
-  case 0x26: return _lwr<EL>;
-  case 0x28: return _sb;
-  case 0x29: return _sh<EL>;
-  case 0x2a: return _swl<EL>;
-  case 0x2b: return _sw<EL>;
-  case 0x2c: return _sdl<EL>;
-  case 0x2d: return _sdr<EL>;
-  case 0x2e: return _swr<EL>;
-  case 0x31: return _lwc1<EL>;
-  case 0x35: return _ldc1<EL>;
-  case 0x37: return _ld<EL>;
-  case 0x39: return _swc1<EL>;
-  case 0x3d: return _sdc1<EL>;
-  case 0x3f: return _sd<EL>;
-    case 0x08: return op_i08<EL>;
-    case 0x09: return op_i09<EL>;
-    case 0x0a: return op_i0a<EL>;
-    case 0x0b: return op_i0b<EL>;
-    case 0x0c: return op_i0c<EL>;
-    case 0x0d: return op_i0d<EL>;
-    case 0x0e: return op_i0e<EL>;
-    case 0x0f: return op_i0f<EL>;
-    case 0x18: return op_i18<EL>;
-    case 0x19: return op_i19<EL>;
-    case 0x27: return op_i27<EL>;
-    case 0x33: return op_i33<EL>;
-    default: break;
+    case 0: {
+      const uint32_t op2 = (inst >> 22) & 7;
+      const uint32_t cond = (inst >> 25) & 15;
+      const bool annul = (inst >> 29) & 1;
+      const uint32_t tgt = pc + (static_cast<uint32_t>(static_cast<int32_t>(inst << 10) >> 10) << 2);
+      if(op2 == 4) {             /* sethi (rd=0, imm=0 is nop) */
+	wr(rd, inst << 10);
+	break;
+      }
+      if(op2 == 7) {             /* CBccc */
+	trap = TT_CP_DISABLED;
+	break;
+      }
+      if(op2 != 2 and op2 != 6) { /* unimp + the V9 encodings */
+	trap = TT_ILLEGAL;
+	break;
+      }
+      if(op2 == 6 and not s->ef) {
+	trap = TT_FP_DISABLED;
+	break;
+      }
+      bool taken = (op2 == 2) ? eval_icc(s, cond) : eval_fcc((s->fsr >> FSR_FCC_SHIFT) & 3, cond);
+      if(cond == 8) {            /* ba / fba: the annul bit kills the delay slot */
+	if(annul) {
+	  new_pc = tgt;
+	  new_npc = tgt + 4;
+	}
+	else {
+	  new_npc = tgt;
+	}
+      }
+      else if(taken) {
+	new_npc = tgt;
+      }
+      else if(annul) {           /* not taken + annul: skip the delay slot */
+	new_pc = npc + 4;
+	new_npc = npc + 8;
+      }
+      break;
     }
-  return exec_itype<EL>;
-}
-
-/* the cold halves of the execMips front end, kept out of line so the hot path (fetch-
- * cache hit, slot load, dispatch) needs few registers and a small prologue */
-static __attribute__((noinline)) bool fetch_refill(state_t *s, uint32_t *ipa_out) {
-  const uint32_t ipa = va_translate(s, (uint64_t)s->pc, tlb_op::fetch);
-  if(s->tlb_fault) {
-    return false;
-  }
-  /* UITLBSTATS models every fetch, so it keeps the cache off */
-  g_fc_valid = (g_uitlb_interval == 0);
-  g_fc_vpage = (uint64_t)s->pc >> 12;
-  g_fc_ppage = ipa & ~0xfffu;
-  g_fc_dpage = dpage_for(ipa);
-  /* RAM and PROM pages are plain memory: fetch straight from the host page.  The MC/
-   * HPC register windows (0x1f000000..0x1fbfffff) and the memory hooks keep mem.get. */
-  const bool via_get = g_mem_hooks || ((ipa >> 24) == 0x1f && ipa < 0x1fc00000u);
-  g_fc_host = via_get ? nullptr : s->mem.peek_raw_ptr(ipa & ~0xfffu);
-  *ipa_out = ipa;
-  return true;
-}
-
-template <bool EL>
-static __attribute__((noinline)) void fill_slot(state_t *s, dinst_t *di, uint32_t ipa) {
-  di->inst = bswap<EL>(g_fc_host ? *reinterpret_cast<uint32_t *>(g_fc_host + (ipa & 0xfffu))
-                                 : s->mem.get<uint32_t>(ipa));
-  di->fn = decode_insn<EL>(di->inst);
-  g_code_page[dpage_key(ipa)] = 1;
-}
-
-template <bool EL, bool DBG>
-void execMips(state_t *s) {
-  sparse_mem &mem = s->mem;
-  s->gpr[0] = 0;   /* MIPS $0 is hardwired to zero; e.g. `mflo $0` must not stick */
-  s->tlb_fault = false;
-  uint32_t ipa;
-  if constexpr(DBG) {
-    if(g_xctx != xctx_compute(s)) {
-      fprintf(stderr, "[xctx] STALE translation context at pc=%08x icnt=%llu: %llx vs %llx\n",
-              (uint32_t)s->pc, (unsigned long long)s->icnt, (unsigned long long)g_xctx,
-              (unsigned long long)xctx_compute(s));
-      abort();
+    case 1:                      /* call */
+      wr(15, pc);
+      new_npc = pc + (inst << 2);
+      break;
+    case 2: {
+      const uint32_t a = s->gpr(rs1);
+      const uint32_t b = imm ? simm13 : s->gpr(inst & 31);
+      switch(op3)
+	{
+	case 0x00: wr(rd, a + b); break;                                  /* add  */
+	case 0x01: wr(rd, a & b); break;                                  /* and  */
+	case 0x02: wr(rd, a | b); break;                                  /* or   */
+	case 0x03: wr(rd, a ^ b); break;                                  /* xor  */
+	case 0x04: wr(rd, a - b); break;                                  /* sub  */
+	case 0x05: wr(rd, a & ~b); break;                                 /* andn */
+	case 0x06: wr(rd, a | ~b); break;                                 /* orn  */
+	case 0x07: wr(rd, ~(a ^ b)); break;                               /* xnor */
+	case 0x08: wr(rd, a + b + s->icc_c); break;                       /* addx */
+	case 0x0c: wr(rd, a - b - s->icc_c); break;                       /* subx */
+	case 0x10: wr(rd, add_cc(s, a, b, 0)); break;                     /* addcc */
+	case 0x14: wr(rd, sub_cc(s, a, b, 0)); break;                     /* subcc */
+	case 0x18: wr(rd, add_cc(s, a, b, s->icc_c)); break;              /* addxcc */
+	case 0x1c: wr(rd, sub_cc(s, a, b, s->icc_c)); break;              /* subxcc */
+	case 0x11: case 0x12: case 0x13:                                  /* andcc orcc xorcc */
+	case 0x15: case 0x16: case 0x17: {                                /* andncc orncc xnorcc */
+	  uint32_t res = 0;
+	  switch(op3 & 7)
+	    {
+	    case 1: res = a & b; break;
+	    case 2: res = a | b; break;
+	    case 3: res = a ^ b; break;
+	    case 5: res = a & ~b; break;
+	    case 6: res = a | ~b; break;
+	    case 7: res = ~(a ^ b); break;
+	    default: UNREACHABLE();
+	    }
+	  set_nz(s, res);
+	  s->icc_v = false;
+	  s->icc_c = false;
+	  wr(rd, res);
+	  break;
+	}
+	case 0x0a: case 0x0b: case 0x1a: case 0x1b: {                     /* umul smul umulcc smulcc */
+	  uint64_t p = (op3 & 1) ?
+	    static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(a)) * static_cast<int32_t>(b)) :
+	    static_cast<uint64_t>(a) * b;
+	  s->y = static_cast<uint32_t>(p >> 32);
+	  if(op3 & 0x10) {
+	    set_nz(s, static_cast<uint32_t>(p));
+	    s->icc_v = false;
+	    s->icc_c = false;
+	  }
+	  wr(rd, static_cast<uint32_t>(p));
+	  break;
+	}
+	case 0x0e: case 0x0f: case 0x1e: case 0x1f: {                     /* udiv sdiv udivcc sdivcc */
+	  if(b == 0) {
+	    trap = TT_DIV_ZERO;
+	    break;
+	  }
+	  uint64_t dividend = (static_cast<uint64_t>(s->y) << 32) | a;
+	  uint32_t q = 0;
+	  bool ovf = false;
+	  if(op3 & 1) {
+	    int64_t n = static_cast<int64_t>(dividend);
+	    int64_t d = static_cast<int32_t>(b);
+	    if(n == INT64_MIN and d == -1) {
+	      q = 0x7fffffffu;
+	      ovf = true;
+	    }
+	    else {
+	      int64_t t = n / d;
+	      if(t > INT32_MAX) {
+		q = 0x7fffffffu;
+		ovf = true;
+	      }
+	      else if(t < INT32_MIN) {
+		q = 0x80000000u;
+		ovf = true;
+	      }
+	      else {
+		q = static_cast<uint32_t>(t);
+	      }
+	    }
+	  }
+	  else {
+	    uint64_t t = dividend / b;
+	    if(t > 0xffffffffULL) {
+	      q = 0xffffffffu;
+	      ovf = true;
+	    }
+	    else {
+	      q = static_cast<uint32_t>(t);
+	    }
+	  }
+	  if(op3 & 0x10) {
+	    set_nz(s, q);
+	    s->icc_v = ovf;
+	    s->icc_c = false;
+	  }
+	  wr(rd, q);
+	  break;
+	}
+	case 0x20: case 0x21: case 0x22: case 0x23: {                     /* taddcc tsubcc taddcctv tsubcctv */
+	  bool is_sub = op3 & 1;
+	  uint32_t res = is_sub ? a - b : a + b;
+	  bool v = is_sub ? ((((a ^ b) & (a ^ res)) >> 31) & 1) : ((((~(a ^ b)) & (a ^ res)) >> 31) & 1);
+	  v = v or ((a | b) & 3);
+	  if((op3 & 2) and v) {
+	    trap = TT_TAG_OVERFLOW;   /* tv forms: no register or icc update */
+	    break;
+	  }
+	  if(is_sub) {
+	    sub_cc(s, a, b, 0);
+	  }
+	  else {
+	    add_cc(s, a, b, 0);
+	  }
+	  s->icc_v = v;
+	  wr(rd, res);
+	  break;
+	}
+	case 0x24: {                                                      /* mulscc */
+	  uint32_t op1 = (static_cast<uint32_t>(s->icc_n != s->icc_v) << 31) | (a >> 1);
+	  uint32_t op2v = (s->y & 1) ? b : 0;
+	  uint32_t res = add_cc(s, op1, op2v, 0);
+	  s->y = ((a & 1) << 31) | (s->y >> 1);
+	  wr(rd, res);
+	  break;
+	}
+	case 0x25: wr(rd, a << (b & 31)); break;                                                     /* sll */
+	case 0x26: wr(rd, a >> (b & 31)); break;                                                     /* srl */
+	case 0x27: wr(rd, static_cast<uint32_t>(static_cast<int32_t>(a) >> (b & 31))); break;       /* sra */
+	case 0x28:                                                        /* rdy / stbar / rdasr */
+	  if(rs1 == 0) {
+	    wr(rd, s->y);
+	  }
+	  else if(rs1 == 15 and rd == 0) {
+	    /* stbar: stores are already in order here */
+	  }
+	  else {
+	    wr(rd, s->asr[rs1]);
+	  }
+	  break;
+	case 0x29: case 0x2a: case 0x2b:                                  /* rdpsr rdwim rdtbr */
+	  if(not s->s) {
+	    trap = TT_PRIVILEGED;
+	    break;
+	  }
+	  wr(rd, (op3 == 0x29) ? s->get_psr() : (op3 == 0x2a) ? s->wim : s->tbr);
+	  break;
+	case 0x30:                                                        /* wry / wrasr (note: xor) */
+	  if(rd == 0) {
+	    s->y = a ^ b;
+	  }
+	  else {
+	    s->asr[rd] = a ^ b;
+	  }
+	  break;
+	case 0x31: case 0x32: case 0x33: {                                /* wrpsr wrwim wrtbr */
+	  if(not s->s) {
+	    trap = TT_PRIVILEGED;
+	    break;
+	  }
+	  uint32_t v = a ^ b;
+	  if(op3 == 0x31) {
+	    if((v & 31) >= NWINDOWS) {
+	      trap = TT_ILLEGAL;
+	      break;
+	    }
+	    s->set_psr(v);
+	  }
+	  else if(op3 == 0x32) {
+	    s->wim = v & ((1u << NWINDOWS) - 1);
+	  }
+	  else {
+	    s->tbr = (v & 0xfffff000u) | (s->tbr & 0xff0u);
+	  }
+	  break;
+	}
+	case 0x34: case 0x35:                                             /* FPop1 FPop2 */
+	  if(not s->ef) {
+	    trap = TT_FP_DISABLED;
+	    break;
+	  }
+	  trap = exec_fpop(s, pc, inst, op3 == 0x35);
+	  break;
+	case 0x36: case 0x37:                                             /* CPop */
+	  trap = TT_CP_DISABLED;
+	  break;
+	case 0x38: {                                                      /* jmpl */
+	  uint32_t tgt = a + b;
+	  if(tgt & 3) {
+	    trap = TT_UNALIGNED;
+	    break;
+	  }
+	  wr(rd, pc);
+	  new_npc = tgt;
+	  break;
+	}
+	case 0x39: {                                                      /* rett */
+	  uint32_t tgt = a + b;
+	  uint32_t ncwp = (s->cwp + 1) % NWINDOWS;
+	  if(s->et) {
+	    trap = s->s ? TT_ILLEGAL : TT_PRIVILEGED;
+	    break;
+	  }
+	  /* ET=0: any of these is a trap with ET=0, i.e. error mode */
+	  if(not s->s) {
+	    trap = TT_PRIVILEGED;
+	    break;
+	  }
+	  if((s->wim >> ncwp) & 1) {
+	    trap = TT_WIN_UNDERFLOW;
+	    break;
+	  }
+	  if(tgt & 3) {
+	    trap = TT_UNALIGNED;
+	    break;
+	  }
+	  s->cwp = ncwp;
+	  s->et = true;
+	  s->s = s->ps;
+	  new_npc = tgt;
+	  break;
+	}
+	case 0x3a:                                                        /* ticc */
+	  if(eval_icc(s, (inst >> 25) & 15)) {
+	    trap = TT_TRAP_INSN_BASE + ((a + b) & 0x7f);
+	  }
+	  break;
+	case 0x3b:                                                        /* flush: no I-cache to keep coherent */
+	  break;
+	case 0x3c: case 0x3d: {                                           /* save restore */
+	  bool is_save = (op3 == 0x3c);
+	  uint32_t ncwp = is_save ? (s->cwp + NWINDOWS - 1) % NWINDOWS : (s->cwp + 1) % NWINDOWS;
+	  if((s->wim >> ncwp) & 1) {
+	    if(not s->user_emu) {
+	      trap = is_save ? TT_WIN_OVERFLOW : TT_WIN_UNDERFLOW;
+	      break;
+	    }
+	    if(is_save) {
+	      emu_spill(s);
+	    }
+	    else {
+	      emu_fill(s);
+	    }
+	  }
+	  /* sources read in the old window, rd written in the new one */
+	  s->cwp = ncwp;
+	  wr(rd, a + b);
+	  break;
+	}
+	default:
+	  trap = TT_ILLEGAL;
+	  break;
+	}
+      break;
     }
-  }
-  if(__builtin_expect(g_fc_valid && ((uint64_t)s->pc >> 12) == g_fc_vpage, 1)) {
-    ipa = g_fc_ppage | (uint32_t)(s->pc & 0xfffULL);
-#ifdef ENABLE_CACHE_MODEL
-    s->mem.cache_active = false;   /* as va_translate does: fetches are uncached in cache_model */
-#endif
-  }
-  else if(!fetch_refill(s, &ipa)) {
-    return;                        /* instruction-fetch TLB miss -> vectored */
-  }
-  /* decoded-instruction cache (Bedichek, "decode once, execute many"): slots are
-   * cleared when their physical page is written (code_page_written), so a filled
-   * slot is current and the raw word is only read to fill an empty one */
-  dinst_t *di = &g_fc_dpage[(ipa >> 2) & (DPAGE_SLOTS - 1)];
-  if(unlikely(di->fn == nullptr)) {
-    fill_slot<EL>(s, di, ipa);
-  }
-  const uint32_t inst = di->inst;
-  if constexpr(DBG) { static const bool g_dis = getenv("DISPROBE") != nullptr;
-    static uint32_t seen[128]; static int nseen=0;
-    uint32_t pc32=(uint32_t)s->pc;
-    bool inrange = (pc32>=0x0e636948u && pc32<0x0e6369c0u) || (pc32>=0x0e635d00u && pc32<0x0e635d60u);
-    if(g_dis && inrange) {
-      bool dup=false; for(int k=0;k<nseen;k++) if(seen[k]==pc32){dup=true;break;}
-      if(!dup && nseen<128){ seen[nseen++]=pc32;
-        fprintf(stderr,"[dis] %08x  %08x\n", pc32, inst); }
+    case 3: {
+      const uint32_t a = s->gpr(rs1);
+      const uint32_t addr = a + (imm ? simm13 : s->gpr(inst & 31));
+      uint32_t asi = s->s ? 0xb : 0xa;
+      const bool is_int = (op3 < 0x20);
+      const bool is_alt = is_int and (op3 & 0x10);
+      if(is_alt) {                            /* alternate space */
+	if(not s->s) {
+	  trap = TT_PRIVILEGED;
+	  break;
+	}
+	if(imm) {
+	  trap = TT_ILLEGAL;
+	  break;
+	}
+	asi = (inst >> 5) & 0xff;
+      }
+      if(not is_int) {
+	if(op3 >= 0x30) {
+	  bool cp = (op3 <= 0x37) and (op3 != 0x32);
+	  trap = cp ? TT_CP_DISABLED : TT_ILLEGAL;
+	  break;
+	}
+	if(op3 == 0x22 or op3 >= 0x28) {
+	  trap = TT_ILLEGAL;
+	  break;
+	}
+	if(op3 == 0x26 and not s->s) {           /* stdfq is privileged */
+	  trap = TT_PRIVILEGED;
+	  break;
+	}
+	if(not s->ef) {
+	  trap = TT_FP_DISABLED;
+	  break;
+	}
+      }
+      const uint32_t base_op = is_int ? (op3 & 0xf) : op3;
+      uint32_t sz = 4;
+      switch(base_op)
+	{
+	case 0x01: case 0x05: case 0x09: case 0x0d:
+	  sz = 1;
+	  break;
+	case 0x02: case 0x06: case 0x0a:
+	  sz = 2;
+	  break;
+	case 0x03: case 0x07: case 0x23: case 0x26: case 0x27:
+	  sz = 8;
+	  break;
+	default:
+	  break;
+	}
+      if(is_int and (base_op == 0x08 or base_op == 0x0b or base_op == 0x0c or base_op == 0x0e)) {
+	trap = TT_ILLEGAL;                    /* V9 ldsw/ldx/stx/casa encodings */
+	break;
+      }
+      if(is_int and (base_op == 0x03 or base_op == 0x07) and (rd & 1)) {
+	trap = TT_ILLEGAL;                    /* ldd/std with an odd rd */
+	break;
+      }
+      if(addr & (sz - 1)) {
+	trap = TT_UNALIGNED;
+	break;
+      }
+      const bool is_store = (base_op == 0x04 or base_op == 0x05 or base_op == 0x06 or base_op == 0x07 or
+			     base_op == 0x0d or base_op == 0x0f or (base_op >= 0x24 and base_op <= 0x27));
+      const bool mem = asi_is_memory(asi);
+      uint64_t pa = 0;
+      if(mem and mmu_xlate(s, asi, addr, is_store ? acc_t::store : acc_t::load, &pa) != FT_NONE) {
+	/* MCR.NF: the fault is recorded but does not trap (the access is dropped) */
+	if(not (s->mmu_ctrl & MCR_NF)) {
+	  trap = TT_DACCESS;
+	}
+	break;
+      }
+      /* off = byte offset within the (single-page, naturally aligned) access */
+      auto ld32 = [&](uint32_t off) -> uint32_t {
+	return mem ? ld_phys<uint32_t>(s, pa + off) : asi_load(s, asi, addr + off);
+      };
+      auto st32 = [&](uint32_t off, uint32_t v) {
+	if(mem) {
+	  st_phys<uint32_t>(s, pa + off, v);
+	}
+	else {
+	  asi_store(s, asi, addr + off, v);
+	}
+      };
+      auto ld8 = [&]() -> uint8_t {
+	return mem ? ld_phys<uint8_t>(s, pa) : static_cast<uint8_t>(asi_load(s, asi, addr));
+      };
+      auto ld16 = [&]() -> uint16_t {
+	return mem ? ld_phys<uint16_t>(s, pa) : static_cast<uint16_t>(asi_load(s, asi, addr));
+      };
+      auto st8 = [&](uint8_t v) {
+	if(mem) {
+	  st_phys<uint8_t>(s, pa, v);
+	}
+	else {
+	  asi_store(s, asi, addr, v);
+	}
+      };
+      auto st16 = [&](uint16_t v) {
+	if(mem) {
+	  st_phys<uint16_t>(s, pa, v);
+	}
+	else {
+	  asi_store(s, asi, addr, v);
+	}
+      };
+      switch(base_op)
+	{
+	case 0x00: wr(rd, ld32(0)); break;                                                 /* ld   */
+	case 0x01: wr(rd, ld8()); break;                                                   /* ldub */
+	case 0x02: wr(rd, ld16()); break;                                                  /* lduh */
+	case 0x09: wr(rd, static_cast<uint32_t>(static_cast<int8_t>(ld8()))); break;       /* ldsb */
+	case 0x0a: wr(rd, static_cast<uint32_t>(static_cast<int16_t>(ld16()))); break;     /* ldsh */
+	case 0x03: {                                                                       /* ldd  */
+	  uint32_t hi = ld32(0);
+	  uint32_t lo = ld32(4);
+	  wr(rd, hi);
+	  wr(rd + 1, lo);
+	  break;
+	}
+	case 0x04: st32(0, s->gpr(rd)); break;                                             /* st   */
+	case 0x05: st8(static_cast<uint8_t>(s->gpr(rd))); break;                           /* stb  */
+	case 0x06: st16(static_cast<uint16_t>(s->gpr(rd))); break;                         /* sth  */
+	case 0x07:                                                                         /* std  */
+	  st32(0, s->gpr(rd));
+	  st32(4, s->gpr(rd + 1));
+	  break;
+	case 0x0d: {                                                                       /* ldstub */
+	  uint8_t v = ld8();
+	  st8(0xff);
+	  wr(rd, v);
+	  break;
+	}
+	case 0x0f: {                                                                       /* swap */
+	  uint32_t v = ld32(0);
+	  st32(0, s->gpr(rd));
+	  wr(rd, v);
+	  break;
+	}
+	case 0x20: s->f[rd] = ld32(0); break;                                              /* ldf   */
+	case 0x21: {                                                                       /* ldfsr */
+	  uint32_t v = ld32(0);
+	  s->fsr = (s->fsr & ~FSR_LDFSR_MASK) | (v & FSR_LDFSR_MASK);
+	  break;
+	}
+	case 0x23:                                                                         /* lddf  */
+	  set_d(s, rd, (static_cast<uint64_t>(ld32(0)) << 32) | ld32(4));
+	  break;
+	case 0x24: st32(0, s->f[rd]); break;                                               /* stf   */
+	case 0x25: st32(0, s->fsr); break;                                                 /* stfsr */
+	case 0x26:                                                                         /* stdfq */
+	  st32(0, s->fq_addr);
+	  st32(4, s->fq_insn);
+	  s->fsr &= ~FSR_QNE;
+	  break;
+	case 0x27:                                                                         /* stdf  */
+	  st32(0, s->f[rd & ~1u]);
+	  st32(4, s->f[rd | 1u]);
+	  break;
+	default:
+	  trap = TT_ILLEGAL;
+	  break;
+	}
+      if(s->bus_error and mmu_bus_error(s, pa, is_store, false, is_alt)) {
+	/* NOTE: the access's register/memory side effects already happened; the
+	 * faulting part read 0 or was dropped (qemu also completes the insn on
+	 * the no-trap path) */
+	trap = TT_DACCESS_ERROR;
+      }
+      break;
     }
+    }
+
+  if(trap != NO_TRAP) {
+    /* s->pc/npc still name the trapping insn: %l1/%l2 get PC/nPC of it */
+    if(s->user_emu and trap == TT_TRAP_INSN_BASE + 0x10) {
+      s->icnt++;
+      emu_syscall(s);
+      return;
+    }
+    take_trap(s, trap);
+    return;
   }
-  if(globals::trace_retirement and false) {
-    std::cout << std::hex
-	      << "cosim "
-	      << s->pc << ","
-	      << std::dec << " : "
-	      << getAsmString(inst, s->pc) << "\n";
-  }
-  //std::cout << std::hex << s->pc << std::dec << " : "
-  //<< getAsmString(inst, s->pc) << "\n";
-  uint32_t opcode = inst>>26;
-  bool isRType = (opcode==0);
-  bool isJType = ((opcode>>1)==1);
-  bool isCoproc0 = (opcode == 0x10);
-  bool isCoproc1 = (opcode == 0x11);
-  bool isCoproc1x = (opcode == 0x13);
-  bool isCoproc2 = (opcode == 0x12);
-  bool isSpecial2 = (opcode == 0x1c); 
-  bool isSpecial3 = (opcode == 0x1f);
-  bool isLoadLinked = (opcode == 0x30);
-  bool isStoreCond = (opcode == 0x38);
-  bool isLoadLinkedD = (opcode == 0x34);   /* lld */
-  bool isStoreCondD = (opcode == 0x3c);    /* scd */
-  uint32_t rs = (inst >> 21) & 31;
-  uint32_t rt = (inst >> 16) & 31;
-  uint32_t rd = (inst >> 11) & 31;
   s->icnt++;
-  /* RETLOG: scoped (icnt in [RETLO,RETHI]) retire log mirroring the silicon flight recorder
-   * (pc + first-changed-GPR + value), emitted for the PREVIOUS instruction (its result is now
-   * visible in s->gpr).  Used to align golden vs the silicon window and find the first divergence. */
-  if constexpr(DBG) { static const uint64_t rlo = getenv("RETLO") ? strtoull(getenv("RETLO"),0,0) : 0;
-    static const uint64_t rhi = getenv("RETHI") ? strtoull(getenv("RETHI"),0,0) : 0;
-    static int64_t pg[32]; static uint32_t ppc=0; static uint64_t picnt=0; static bool ph=false;
-    if(rlo && s->icnt>=rlo && s->icnt<=rhi) {
-      if(ph) {
-        int wr=-1; for(int k=1;k<32;k++) if(s->gpr[k]!=pg[k]) { wr=k; break; }
-        if(wr>=0) fprintf(stderr,"[ret] icnt=%llu pc=%08x r%d=%016llx\n",
-                          (unsigned long long)picnt, ppc, wr, (unsigned long long)s->gpr[wr]);
-        else      fprintf(stderr,"[ret] icnt=%llu pc=%08x (nowr)\n",(unsigned long long)picnt, ppc);
-      }
-      memcpy(pg, s->gpr, sizeof(pg)); ppc=(uint32_t)s->pc; picnt=s->icnt; ph=true;
-    } else ph=false;
-  }
-  /* NANWATCH=<count>: find where a NaN is BORN in the FP register file.
-   * Follows the RETLOG idiom -- the FP file is snapshotted before the current
-   * instruction runs and compared at the top of the NEXT call, so the culprit
-   * is always the PREVIOUS instruction (whose result is now visible).
-   *
-   * We watch ALL 32 registers rather than just an FP arith destination on
-   * purpose: the ISS traps every div/sqrt to the IRIX emulator, so a bad
-   * emulated result re-enters the FP file through a context RESTORE (ldc1 /
-   * dmtc1 in kernel mode), not through an arithmetic op.  An arith-only
-   * detector would miss exactly the case we most suspect.
-   *
-   * A register that was ALREADY NaN is ignored -- propagation is not birth.
-   * Format comes from cpr1_state[]; `unknown` is read as double (the FP codes
-   * under test -- turb3d/apsi/hydro2d -- are double precision).
-   * NANWATCH_MINICNT skips the boot so daemons//etc/init noise is suppressed. */
-  if constexpr(DBG) { /* periodic FP-trap census: the process may be killed rather than exit
-     * cleanly, and on a long soak we want the trend, not just a final total. */
-    static const uint64_t g_ftc = getenv("FPTRAPCOUNT") ? strtoull(getenv("FPTRAPCOUNT"),0,0) : 0;
-    if(g_ftc > 1 && (s->icnt % g_ftc) == 0) {
-      uint64_t tot = 0;
-      for(int i = 0; i < 8; i++) {
-        tot += g_fptrap[i];
-      }
-      fprintf(stderr, "[fptrap] icnt=%llu total=%llu", (unsigned long long)s->icnt,
-              (unsigned long long)tot);
-      for(int i = 0; i < 8; i++) {
-        if(g_fptrap[i]) {
-          fprintf(stderr, " %s=%llu", g_fptrap_name[i], (unsigned long long)g_fptrap[i]);
-        }
-      }
-      fprintf(stderr, "\n");
-    }
-  }
-  if constexpr(DBG) { static const uint64_t g_nanwatch = getenv("NANWATCH") ? strtoull(getenv("NANWATCH"),0,0) : 0;
-    static const uint64_t g_nw_min = getenv("NANWATCH_MINICNT") ? strtoull(getenv("NANWATCH_MINICNT"),0,0) : 0;
-    if(g_nanwatch && s->icnt >= g_nw_min) {
-      static uint64_t pf[32]; static uint8_t pdbl_v[32];
-      static uint32_t ppc = 0, pinst = 0; static uint64_t picnt = 0;
-      static bool ph = false; static uint64_t nfired = 0, nconsumed = 0;
-      static nan_taint_t g_pend_taint; static int g_pend_reg = -1; static bool g_pend_dbl = false;
-      if(g_pend_reg >= 0) {
-        /* The previous instruction's result is now visible: keep the tag only if
-         * it actually produced a NaN, otherwise the value is clean. */
-        g_ftaint[g_pend_reg] = fp_is_nan(s->cpr1[g_pend_reg], g_pend_dbl) ? g_pend_taint : nan_taint_t();
-        g_pend_reg = -1;
-      }
-      if(ph && nfired < g_nanwatch) {
-        for(int k = 0; k < 32; k++) {
-          bool dbl = (s->cpr1_state[k] != fp_reg_state::sp);
-          if(!fp_is_nan(s->cpr1[k], dbl)) {
-            continue;
-          }
-          if(fp_is_nan(pf[k], pdbl_v[k] != 0)) {
-            continue;   /* already NaN before: propagation, not birth */
-          }
-          /* Classify the culprit.  IRIX's bcopy moves 8 bytes at a time with
-           * ldc1/sdc1, so a naive "this register became NaN" test trips
-           * constantly on USER-mode FP loads of pointer-ish stack data -- that
-           * is NaN-SHAPED DATA, not a NaN.  Keep only the two meaningful cases:
-           *   ARITH  -- a COP1 arithmetic op produced it (a real IEEE invalid)
-           *   KERNEL -- a kernel-mode FP write produced it, i.e. the FP emulator
-           *             or a context restore, which is the path a trapped
-           *             div.d/sqrt.d takes and our prime suspect.
-           * A user-mode FP load/move is dropped as data movement. */
-          uint32_t sr = s->cpr0[CPR0_SR];
-          bool kmode = ((sr & 0x6) != 0) || (((sr >> 3) & 3) == 0);   /* EXL|ERL set, or KSU==kernel */
-          uint32_t pfmt = (pinst >> 21) & 31;
-          uint32_t pfn  = pinst & 0x3f;
-          bool is_arith = ((pinst >> 26) == 0x11) && (pfmt == 16 || pfmt == 17) &&
-                          (pfn <= 7) && (pfn != 6);
-          if(!is_arith) {
-            continue;   /* non-arith writes are reported via the USE line's ORIGIN */
-          }
-          nfired++;
-          fprintf(stderr, "[nanwatch] #%llu %s NaN born in f%d: icnt=%llu pc=%08x inst=%08x %s\n",
-                  (unsigned long long)nfired, is_arith ? "ARITH" : "KERNEL", k,
-                  (unsigned long long)picnt, ppc, pinst,
-                  getAsmString(pinst, ppc).c_str());
-          fprintf(stderr, "[nanwatch]     f%d: %016llx -> %016llx (%s)\n", k,
-                  (unsigned long long)pf[k], (unsigned long long)s->cpr1[k], dbl ? "d" : "s");
-          /* For an arith culprit print its operands as they stood BEFORE it
-           * executed -- that is the "what generated the NaN" answer. */
-          if(is_arith) {
-            bool adbl = (pfmt == 17);
-            uint32_t fs = (pinst >> 11) & 31, ft = (pinst >> 16) & 31;
-            fprintf(stderr, "[nanwatch]     operands fs=f%u %016llx (%.17g)  ft=f%u %016llx (%.17g)\n",
-                    fs, (unsigned long long)pf[fs], fp_as_double(pf[fs], adbl),
-                    ft, (unsigned long long)pf[ft], fp_as_double(pf[ft], adbl));
-          }
-          fprintf(stderr, "[nanwatch]     sr=%08x cause=%08x epc=%08x fcsr=%08x kernel=%d\n",
-                  sr, s->cpr0[CPR0_CAUSE], s->cpr0[CPR0_EPC], s->fcr1[CP1_CR31], kmode ? 1 : 0);
-        }
-      }
-      /* Taint propagation + reporting, done BEFORE the instruction executes so
-       * the source values and the effective address are the architectural ones. */
-      uint32_t op6 = inst >> 26;
-      if(op6 == 0x11 || op6 == 0x31 || op6 == 0x35 || op6 == 0x39 || op6 == 0x3d) {
-        uint32_t cfmt = (inst >> 21) & 31;
-        uint32_t cfn  = inst & 0x3f;
-        uint32_t cfs  = (inst >> 11) & 31;
-        uint32_t cft  = (inst >> 16) & 31;
-        uint32_t cfd  = (inst >> 6)  & 31;
-        bool cdbl     = (cfmt == 17);
-        if(op6 == 0x11 && (cfmt == 16 || cfmt == 17)) {
-          bool two_src  = (cfn <= 3) || (cfn >= 0x30);
-          bool consumer = (cfn <= 7 && cfn != 6) || (cfn >= 0x20 && cfn <= 0x25) || (cfn >= 0x30);
-          if(consumer) {
-            /* Report the first arithmetic USE of a NaN, naming its ORIGIN. */
-            for(int w = 0; w < (two_src ? 2 : 1); w++) {
-              uint32_t rg = (w == 0) ? cfs : cft;
-              if(!fp_is_nan(s->cpr1[rg], cdbl) || nconsumed >= g_nanwatch) {
-                continue;
-              }
-              nconsumed++;
-              const nan_taint_t &t = g_ftaint[rg];
-              fprintf(stderr, "[nanwatch] USE#%llu f%u=%016llx read by icnt=%llu pc=%08x inst=%08x\n",
-                      (unsigned long long)nconsumed, rg, (unsigned long long)s->cpr1[rg],
-                      (unsigned long long)s->icnt, (uint32_t)s->pc, inst);
-              fprintf(stderr, "[nanwatch]     ORIGIN %s icnt=%llu pc=%08x inst=%08x va=%016llx\n",
-                      nan_kind_name(t.kind), (unsigned long long)t.icnt, t.pc, t.inst,
-                      (unsigned long long)t.addr);
-              fprintf(stderr, "[nanwatch]     sr=%08x cause=%08x epc=%08x fcsr=%08x\n",
-                      s->cpr0[CPR0_SR], s->cpr0[CPR0_CAUSE], s->cpr0[CPR0_EPC], s->fcr1[CP1_CR31]);
-              break;
-            }
-            /* Result taint: inherit from a NaN source (keep the ROOT), else a
-             * fresh ARITH birth if this op is about to manufacture one. */
-            nan_taint_t inh; inh.kind = 0;
-            for(int w = 0; w < (two_src ? 2 : 1); w++) {
-              uint32_t rg = (w == 0) ? cfs : cft;
-              if(fp_is_nan(s->cpr1[rg], cdbl) && g_ftaint[rg].kind != 0) {
-                inh = g_ftaint[rg]; break;
-              }
-            }
-            if(inh.kind == 0) {
-              inh.icnt = s->icnt; inh.pc = (uint32_t)s->pc; inh.inst = inst; inh.kind = 1;
-            }
-            if(cfn < 0x30) {   /* compares write a cc, not an FP register */
-              g_pend_taint = inh; g_pend_reg = (int)cfd; g_pend_dbl = cdbl;
-            }
-          }
-          else if(cfn == 6) {   /* mov.fmt: a pure copy, carry the tag */
-            g_pend_taint = g_ftaint[cfs]; g_pend_reg = (int)cfd; g_pend_dbl = cdbl;
-          }
-        }
-        else if(op6 == 0x11 && (cfmt == 4 || cfmt == 5)) {   /* mtc1 / dmtc1 */
-          nan_taint_t t; t.icnt = s->icnt; t.pc = (uint32_t)s->pc; t.inst = inst; t.kind = 2;
-          g_pend_taint = t; g_pend_reg = (int)cfs; g_pend_dbl = (cfmt == 5);
-        }
-        else if(op6 == 0x31 || op6 == 0x35) {   /* lwc1 / ldc1 -- inherit through memory */
-          uint64_t ea = (uint64_t)(s->gpr[(inst >> 21) & 31] + (int32_t)(int16_t)(inst & 0xffff));
-          nan_taint_t t; t.kind = 0;
-          if(!g_mtaint.empty()) {
-            auto it = g_mtaint.find(ea);
-            if(it != g_mtaint.end()) { t = it->second; }
-          }
-          if(t.kind == 0) {   /* no FP store we saw wrote this: EXTERN if it is a NaN */
-            t.icnt = s->icnt; t.pc = (uint32_t)s->pc; t.inst = inst; t.kind = 2; t.addr = ea;
-          }
-          g_pend_taint = t; g_pend_reg = (int)cft; g_pend_dbl = (op6 == 0x35);
-        }
-        else if(op6 == 0x39 || op6 == 0x3d) {   /* swc1 / sdc1 -- carry the tag into memory */
-          uint64_t ea = (uint64_t)(s->gpr[(inst >> 21) & 31] + (int32_t)(int16_t)(inst & 0xffff));
-          bool sdbl = (op6 == 0x3d);
-          if(fp_is_nan(s->cpr1[cft], sdbl)) {
-            g_mtaint[ea] = g_ftaint[cft];
-          }
-          else if(!g_mtaint.empty()) {
-            g_mtaint.erase(ea);
-          }
-        }
-      }
-      /* Only snapshot around instructions that can ARCHITECTURALLY write an FP
-       * register -- COP1/COP1X arith+moves and the FP loads.  Everything else
-       * cannot change cpr1[], so scanning after it is wasted work (this keeps
-       * the probe off the hot path of an otherwise integer instruction mix). */
-      uint32_t pop = inst >> 26;
-      ph = (pop == 0x11) || (pop == 0x13) || (pop == 0x31) || (pop == 0x35);
-      if(ph) {
-        for(int k = 0; k < 32; k++) {
-          pdbl_v[k] = (s->cpr1_state[k] != fp_reg_state::sp) ? 1 : 0;
-        }
-        memcpy(pf, s->cpr1, sizeof(pf));
-        ppc = (uint32_t)s->pc; pinst = inst; picnt = s->icnt;
-      }
-    }
-  }
-  if constexpr(DBG) { /* PCHASH: rolling FNV-1a over the retired-PC stream, checkpoint every 65536.
-     * Compared against henry_tb's identical hash to find the first RTL/ISS PC
-     * divergence (expected only once interrupts skew the streams). */
-    static const bool g_pchash = getenv("PCHASH") != nullptr;
-    if(g_pchash) {
-      static uint64_t h = 1469598103934665603ULL;
-      h = (h ^ (uint32_t)s->pc) * 1099511628211ULL;
-      if((s->icnt & 0xffff) == 0) {
-        fprintf(stderr, "[pchash] icnt=%llu hash=%016llx pc=%08x\n",
-                (unsigned long long)s->icnt, (unsigned long long)h, (uint32_t)s->pc);
-      }
-    }
-    static const char *pd = getenv("PCDUMP");   /* "lo:hi" -> raw "P <pc>" for structural diff */
-    static uint64_t pd_lo = 0, pd_hi = 0; static bool pd_init = false;
-    if(!pd_init) { pd_init = true; if(pd) sscanf(pd, "%lu:%lu", &pd_lo, &pd_hi); }
-    if(pd && s->icnt >= pd_lo && s->icnt < pd_hi) {
-      fprintf(stderr, "P %08x\n", (uint32_t)s->pc);
-    }
-  }
-  if(DBG and globals::trace_retirement and globals::retire_log) {
-    /* optional TRACEWIN=lo:hi icnt window so a huge boot can emit a small,
-     * focused retire_trace (e.g. around a single XTLB refill) for mips-analyzer. */
-    static bool tw_init = false; static uint64_t tw_lo = 0, tw_hi = ~0ULL, tw_cap = 0, tw_ring = 0;
-    static bool tw_useronly = false, tw_kernonly = false, tw_trig_user = false, tw_armed = false;
-    static uint32_t tw_freeze_pc = 0;
-    static uint64_t tw_freeze_n = 1, tw_freeze_hits = 0;
-    static uint32_t tw_pc_lo = 0, tw_pc_hi = 0;
-    if(!tw_init) { tw_init = true; const char *tw = getenv("TRACEWIN");
-                   if(tw) sscanf(tw, "%lu:%lu", &tw_lo, &tw_hi);
-                   tw_useronly = getenv("TRACEWIN_USERONLY") != nullptr;
-                   tw_kernonly = getenv("TRACEWIN_KERNELONLY") != nullptr;   // pc >= 0x80000000 only: a
-                                                                             // ring of the net STACK, not
-                                                                             // the user loop between packets
-                   { const char *fp = getenv("TRACEWIN_FREEZE_PC");
-                     if(fp) tw_freeze_pc = strtoul(fp, nullptr, 0);
-                     const char *fn = getenv("TRACEWIN_FREEZE_N");
-                     if(fn) tw_freeze_n = strtoull(fn, nullptr, 0);
-                     const char *pl = getenv("TRACEWIN_PC_LO"), *ph = getenv("TRACEWIN_PC_HI");
-                     if(pl) tw_pc_lo = strtoul(pl, nullptr, 0);
-                     if(ph) tw_pc_hi = strtoul(ph, nullptr, 0); }
-                   tw_trig_user = getenv("TRACEWIN_TRIG_USER") != nullptr;      // arm on first o32 entry
-                   if(getenv("TRACEWIN_N")) tw_cap = strtoull(getenv("TRACEWIN_N"),0,0);
-                   if(getenv("TRACEWIN_RING")) tw_ring = strtoull(getenv("TRACEWIN_RING"),0,0);  // keep LAST N
-                   if(tw || tw_ring) fprintf(stderr, "[tracewin] lo=%llu hi=%llu useronly=%d cap=%llu ring=%llu\n",
-                                  (unsigned long long)tw_lo, (unsigned long long)tw_hi, tw_useronly,
-                                  (unsigned long long)tw_cap, (unsigned long long)tw_ring); }
-    if(tw_trig_user && !tw_armed && (uint32_t)s->pc < 0x80000000u) tw_armed = true;
-    if(!g_ring_frozen && s->icnt >= tw_lo && s->icnt < tw_hi && (!tw_trig_user || tw_armed)
-       && (tw_ring != 0 || tw_cap == 0 || globals::retire_log->get_records().size() < tw_cap)
-       && !(tw_useronly && (uint32_t)s->pc >= 0x80000000u)
-       && !(tw_kernonly && (uint32_t)s->pc <  0x80000000u)
-       && !(tw_pc_hi && ((uint32_t)s->pc < tw_pc_lo || (uint32_t)s->pc >= tw_pc_hi))) {
-      auto &recs = globals::retire_log->get_records();
-      recs.emplace_back(ipa, (uint64_t)s->pc, inst);
-      /* TRACEWIN_RING=N: keep only the last N records (trace the run-up to a crash,
-       * regardless of exact icnt). std::list pop_front is O(1). */
-      if(tw_ring != 0 && recs.size() > tw_ring) recs.pop_front();
-      if(tw_freeze_pc && (uint32_t)s->pc == tw_freeze_pc && tw_ring != 0 && recs.size() >= tw_ring
-         && (++tw_freeze_hits >= tw_freeze_n)) {
-        g_ring_frozen = true;
-        /* Force a CLEAN exit ~1 insn later so main() serializes the trace (a kill -9
-         * would discard it -- the boost archive is written only at normal exit). The
-         * ring is already frozen, so the trailing insns don't pollute it. */
-        s->maxicnt = s->icnt + 1;
-        fprintf(stderr, "[tracewin] froze ring at pc=%08x icnt=%llu (exiting to flush)\n",
-                tw_freeze_pc, (unsigned long long)s->icnt);
-      }
-    }
-  }
-  /* ASIDPC=<file>: per USERSPACE retire, dump (asid<<32 | vpc) as an 8-byte LE record.
-   * Offline: find be's ASID (the asid seen at vpc==0e788bc0), filter to it -> a be-only
-   * PC golden that aligns to the ASID-filtered silicon deep trace to locate the fork. */
-  if constexpr(DBG) { static FILE* g_asidpc = [](){ const char* p = getenv("ASIDPC"); return p ? fopen(p, "wb") : (FILE*)nullptr; }();
-    if(g_asidpc && globals::asidpc_armed && (uint32_t)s->pc < 0x80000000u) {
-      uint64_t rec = ((uint64_t)(s->cpr0_64[CPR0_ENTRYHI] & 0xffULL) << 32) | (uint32_t)s->pc;
-      fwrite(&rec, 8, 1, g_asidpc);
-    } }
-  if(DBG and globals::pctrace) {
-    static const bool useronly = getenv("PCTRACE_USERONLY") != nullptr;  /* only pc<0x80000000 */
-    if(!globals::pctrace_on && (uint32_t)s->pc == globals::pctrace_start) globals::pctrace_on = true;
-    if(globals::pctrace_on && !(useronly && (uint32_t)s->pc >= 0x80000000u))
-      fprintf(globals::pctrace, "%08x\n", (uint32_t)s->pc);
-  }
- 
-  
-  
-  di->fn(inst, s);
+  s->pc = new_pc;
+  s->npc = new_npc;
 }

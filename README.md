@@ -1,15 +1,17 @@
-# indysim
+# ss10sim
 
-An SGI Indy (IP22) system simulator, split from
-[interp_mips](https://github.com/dsheffie/interp_mips) with its full history. Run with
-`--newport` (or `--sdl` for a window) for Newport XL graphics and PS/2 keyboard/mouse:
-IRIX 6.5 boots to Xsgi and the 4Dwm desktop.
+A functional SPARC V8 full-system simulator for the sun4m SPARCstation 10/20
+(SuperSPARC). It is the reference ISS and test bed for the
+[superdupersparc](https://github.com/dsheffie/superdupersparc) core. It was split
+from indysim/interp_mips, and the history is kept.
 
-A fast **functional** MIPS (R4000 / SGI IP22) instruction-set simulator. It boots
-SGI IP22 firmware + kernels (IRIX 6.5, IP22 Linux) using a **1:1 virtual→physical
-mapping** (no real TLB datapath), which sidesteps the RTL's TLB wall and makes it
-a convenient oracle / co-sim reference for the r9999 core and the henry SoC, and
-the place to get the **HPC3 SCSI-DMA + WD33C93 + disk** model right (`sgi_scsi.cc`).
+Modeled: the SRMMU and IOMMU, the sun4m interrupt controller and timers, the ESCC
+serial ports, the M48T08 NVRAM/RTC, and the ESP SCSI controller with its DMA (a
+port of qemu 8.2 `esp.c`) driving SCSI-2 disk and CD-ROM targets.
+
+What runs: the real SS-20 OBP 2.25 (to the `ok` prompt, `probe-scsi`, and
+`boot disk`/`boot cdrom`), OpenBIOS with a Linux kernel through fw_cfg (boots
+to a SCSI root), and the NeXTSTEP 3.3 install CD (to the installer).
 
 ## Build
 
@@ -17,82 +19,24 @@ the place to get the **HPC3 SCSI-DMA + WD33C93 + disk** model right (`sgi_scsi.c
 make
 ```
 
-The Makefile tracks header/source dependencies (`-MMD` + `-include $(DEP)`), so an
-incremental `make` rebuilds what changed; `make clean` is only needed to force a
-full rebuild.
+Needs boost (program_options, serialization) and capstone.
 
-## Boot IRIX 6.5
+## Run
 
 ```sh
-./interp_mips \
-  -f         /home/dsheffie/code/chd-dumper/extracted/unix \
-  --prom     /home/dsheffie/code/r9999/arcs/henry_arcs.bin \
-  --start-pc 0xbfc00000 \
-  --disk     /home/dsheffie/code/chd-dumper/irix65.img \
-  -m 60000000
+# real OBP, a disk at target 3 and a CD at target 6, typing into ttya
+./ss10sim --rom ss10-20-v2.25r-rom --nvram ss20_nvram.bin --ram 256 \
+  --scsi-disk 3:disk.img --scsi-cdrom 6:cd.iso \
+  --console-input keys.txt --console-input-at 5900000000
+
+# OpenBIOS + Linux
+./ss10sim --rom openbios-sparc32 --kernel vmlinux --append "root=/dev/sda rw" \
+  --scsi-disk 0:guest/root.img
 ```
 
-Reaches the IRIX banner (clean -- no unimplemented ops):
+Other options: `--checkpoint-at`/`--checkpoint-out`/`--restore`, `-m` (the
+instruction limit), and `--trace`/`--pctrace`. See `./ss10sim --help` for the
+full list. The Sun ROM is proprietary and is not in this repo.
 
-```
-r9999 PROM: CPU alive, handing off to the kernel
-IRIX Release 6.5 IP22 Version 10070055 System V
-Copyright 1987-2003 Silicon Graphics, Inc.
-```
-
-`--disk` backs the SCSI root device (the HPC3 SCSI-DMA + WD33C93 + disk model in
-`sgi_scsi.cc`); without it IRIX can't mount root. Getting past "Enter Root
-device" to a mounted root is the work in progress.
-
-## Boot IP22 Linux
-
-```sh
-./interp_mips \
-  -f         /home/dsheffie/code/linux-mips/vmlinux.32 \
-  --prom     /home/dsheffie/code/r9999/arcs/henry_arcs.bin \
-  --start-pc 0xbfc00000 \
-  -m 120000000
-```
-
-Boots to the VFS root mount with full `console=arc` output -- kernel banner, MC
-memory probe, timer calibration, GIO probe, rootfs mount:
-
-```
-Linux version 7.1.0-rc7 ... ARCH: SGI-IP22
-MC: bank0:  16M @ 08000000
-Calibrating system timer... 200000 [100.0000 MHz CPU]
-Calibrating delay loop... 99.32 BogoMIPS (lpj=198656)
-VFS: Finished mounting rootfs on nullfs
-```
-
-The kernel cmdline is `root=scsi(0)disk(1)rdisk(0)partition(0)` with no initrd,
-so mounting a real root via the `sgi_scsi.cc` SCSI model (pass `--disk`) is the
-work in progress. Two fixes make the `console=arc` path work: the MC **System
-Memory Alias** (phys `0..0x7ffff` mirrors DRAM `0x08000000`, mc.pdf p.22) so the
-FSBL-staged SPB/romvec match the kernel's DRAM view, and the `--prom` loader
-patching the **kentry slot** `@0xBFC00008` with the loaded kernel's real entry
-(the firmware default is the IRIX entry; without the patch Linux jumps there and
-derails into the romvec string data). IRIX drives its own SCC console directly,
-so it was unaffected by the romvec issue.
-
-## Firmware / boot loaders
-
-- **`--prom <blob> --start-pc 0xbfc00000`** *(recommended)* -- load a flat FSBL
-  blob (e.g. `r9999/arcs/henry_arcs.bin`) at phys `0x1fc00000` and start at the
-  reset vector. This mirrors exactly how `henry_tb` and the FPGA boot.
-- *(no `--prom` / `--start-pc`)* -- the built-in **pseudo-BIOS** synthesizes the
-  ARCS argv/envp handoff. Older path; the firmware-blob form above is preferred.
-- **`--arcs <blob>`** -- load an ARCS blob at PA `0x1000` (legacy stub scheme).
-
-## Common options
-
-| flag | meaning |
-|------|---------|
-| `-f <elf>` | kernel ELF (IRIX `/unix`, Linux `vmlinux.32`) |
-| `--prom <blob>` | flat FSBL firmware loaded at phys `0x1fc00000` (use with `--start-pc 0xbfc00000`) |
-| `--start-pc <pc>` | start PC; skips the pseudo-BIOS (the firmware does the handoff) |
-| `--disk <img>` | raw SCSI disk image for HD0 (IRIX root, e.g. `irix65.img`) |
-| `-m`, `--maxicnt <n>` | cap on instructions executed |
-
-Paths above are the local checkout locations; adjust for your tree. The IP22
-firmware blob `henry_arcs.bin` is built in `r9999/arcs/` (`make`).
+`guest/` builds test images: `mkroot.sh` makes an ext2 Linux root, and
+`mksunboot.py` makes a Sun-labelled disk with an a.out boot block for OBP.

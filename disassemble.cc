@@ -8,9 +8,7 @@
 #include <array>
 #include <map>
 #include <string>
-#ifndef __EMSCRIPTEN__
 #include <capstone/capstone.h>
-#endif
 
 #include "disassemble.hh"
 
@@ -41,7 +39,6 @@ void disassemble(std::ostream &out, uint32_t inst, uint32_t addr) {
 }
 
 
-#ifndef __EMSCRIPTEN__
 static const std::map<cs_err, std::string> cs_error_map =
   {
    {CS_ERR_OK,"CS_ERR_OK"},
@@ -62,7 +59,7 @@ static const std::map<cs_err, std::string> cs_error_map =
 static csh handle;
 
 void initCapstone() {
-  cs_err C = cs_open(CS_ARCH_MIPS, CS_MODE_MIPS64, &handle);
+  cs_err C = cs_open(CS_ARCH_SPARC, CS_MODE_BIG_ENDIAN, &handle);
   if(C != CS_ERR_OK) {
     std::cerr << "capstone error : " << cs_error_map.at(C) << "\n";
     exit(-1);
@@ -77,8 +74,9 @@ std::string getAsmString(uint32_t inst, uint32_t addr) {
   std::stringstream ss;
 
   cs_insn *insn = nullptr;
-
-  size_t count = cs_disasm(handle,reinterpret_cast<const uint8_t *>(&inst),
+  /* capstone wants the insn bytes in memory (big-endian) order */
+  uint32_t be_inst = __builtin_bswap32(inst);
+  size_t count = cs_disasm(handle,reinterpret_cast<const uint8_t *>(&be_inst),
 			   sizeof(inst), addr, 0, &insn);
   if(count != 1) {
     return std::string();
@@ -91,13 +89,6 @@ std::string getAsmString(uint32_t inst, uint32_t addr) {
   cs_free(insn, count);
   return ss.str();
 }
-#else
-/* emscripten: no capstone. The disassembler is a debug-only convenience; stub it
- * so the web build links. getGPRName/getCondName/disassemble() above still work. */
-void initCapstone() {}
-void stopCapstone() {}
-std::string getAsmString(uint32_t inst, uint32_t addr) { return std::string(); }
-#endif
 
 
 

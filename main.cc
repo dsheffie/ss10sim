@@ -1,681 +1,397 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cstdint>
 #include <iostream>
 #include <string>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <sys/mman.h>
 #include <boost/program_options.hpp>
+#include <poll.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include "interpret.hh"
-#include "interrupt.hh"
-#include "ws_profile.hh"
-#include "bbv.hh"
-#include "brtrace.hh"
+#include "sun4m.hh"
 #include "loadelf.hh"
-#include "sparse_mem.hh"
-#include "pseudo_bios.hh"
-#include "sgi_mc.hh"
-#include "sgi_hpc.hh"
-#include "sgi_scc.hh"
-#include "sgi_newport.hh"
-#include "newport_sdl.hh"
-#include "sgi_ps2.hh"
-#include "sgi_scsi.hh"
-#include "sgi_seeq.hh"
-#include "gdbstub.hh"
+#include "disassemble.hh"
+#include "helper.hh"
+#include "ckpt.hh"
 #include "globals.hh"
-#include "inst_record.hh"
-#include "cosim.hh"
-#include <csignal>
 
-namespace po = boost::program_options;
+/* Standalone SPARC V8 ISS driver: run an ELF, optionally under Linux user-mode
+ * syscall/window emulation (--user) so the same static binary can be diffed
+ * against qemu-sparc. */
 
-/* debug watchpoint globals (declared extern in sparse_mem.hh) */
-uint32_t g_watch_pa = 0, g_watch_ldpc = 0;
-uint64_t g_watch_lo = 0, g_watch_hi = ~0ULL;
-uint64_t g_cur_pc = 0, g_cur_icnt = 0;
-uint64_t g_htrace = 0;
-
-/* Async control via signals (handlers only set flags; the run loop tests g_sig_any
- * once per instruction and does the work):
- *   SIGUSR1   -> dump the current IRIX process (comm/pid/pc)
- *   SIGUSR2   -> flush the SCSI COW overlay to its --disk-delta sidecar
- *   SIGURG    -> start recording the retire trace (--retiretrace-signal)
- *   SIGVTALRM -> stop it and write the window to <retiretrace>.<n> */
-static volatile sig_atomic_t g_sig_any        = 0;
-static volatile sig_atomic_t g_sig_dumpproc   = 0;
-static volatile sig_atomic_t g_sig_flushdelta = 0;
-static volatile sig_atomic_t g_sig_trace_on   = 0;
-static volatile sig_atomic_t g_sig_trace_off  = 0;
-static void on_sigusr1(int) { g_sig_dumpproc   = 1; g_sig_any = 1; }
-static void on_sigusr2(int) { g_sig_flushdelta = 1; g_sig_any = 1; }
-static void on_sigurg(int)    { g_sig_trace_on  = 1; g_sig_any = 1; }
-static void on_sigvtalrm(int) { g_sig_trace_off = 1; g_sig_any = 1; }
-
-/* PCRING=<log2 entries>: the lean loop records every instruction's {ASID, PC} in a
- * ring, and SIGUSR1 writes it oldest-first to pcring.<n>.bin (uint64 LE, asid<<32|pc)
- * alongside the process dump.  For hangs: the last thing each process ran before it
- * went to sleep, without a full retire trace. */
-static uint64_t *g_pcring = nullptr;
-static uint64_t g_pcring_mask = 0, g_pcring_pos = 0;
-static int g_pcring_dumps = 0;
-
-static void pcring_dump() {
-  if(g_pcring == nullptr) {
-    return;
-  }
-  const std::string out = "pcring." + std::to_string(g_pcring_dumps++) + ".bin";
-  FILE *fp = fopen(out.c_str(), "wb");
-  if(fp == nullptr) {
-    perror(out.c_str());
-    return;
-  }
-  const uint64_t n = (g_pcring_pos > g_pcring_mask) ? (g_pcring_mask + 1) : g_pcring_pos;
-  for(uint64_t i = g_pcring_pos - n; i != g_pcring_pos; i++) {
-    fwrite(&g_pcring[i & g_pcring_mask], sizeof(uint64_t), 1, fp);
-  }
-  fclose(fp);
-  fprintf(stderr, "[pcring] wrote %llu entries to %s\n", (unsigned long long)n, out.c_str());
-}
-
-/* the lean loop's share of the signal work (the full loop does its own below) */
-static void service_lean_signals(state_t *s) {
-  g_sig_any = 0;
-  if(g_sig_dumpproc) {
-    g_sig_dumpproc = 0;
-    dump_current_process(s);
-    tlbpm_report();
-    pcring_dump();
-  }
-  if(g_sig_flushdelta) {
-    g_sig_flushdelta = 0;
-    if(s->scsi) {
-      s->scsi->flush_delta();
-    }
-  }
-  if(g_sig_trace_on || g_sig_trace_off) {
-    g_sig_trace_on = g_sig_trace_off = 0;
-    fprintf(stderr, "[retiretrace] signals need a non-lean build\n");
-  }
-}
 namespace globals {
   bool enClockFuncts = false;
-  uint64_t icountMIPS = 0;
   uint64_t cycle = 0;
   bool trace_retirement = false;
-  bool exec_dbg = false;
   bool trace_fp = false;
   bool report_syscalls = false;
-  retire_trace *retire_log = nullptr;
-  FILE *pctrace = nullptr;
-  uint32_t pctrace_start = 0x88005960u;
-  bool pctrace_on = false;
-  bool asidpc_armed = false;   /* SIGUSR1 toggles; gates the ASIDPC userspace dump */
-  bool cpu_r5000 = false;
 };
-static state_t *s = nullptr;
 
-/* one lean-loop instruction.  DBG picks execMips' instance (and services gdb), RING
- * records {ASID, PC}; both are fixed per loop instance.  Signals are checked every
- * 64K steps on a local countdown (icnt can step by 2, so no icnt modulo). */
-template <bool DBG, bool RING>
-static inline void lean_step(state_t *s, uint32_t &sigpoll) {
-  maybe_take_interrupt_inline(s);   /* CP0 Count/Compare timer + Int delivery (per step) */
-  if constexpr(RING) {
-    g_pcring[g_pcring_pos++ & g_pcring_mask] = ((uint64_t)(s->cpr0[CPR0_ENTRYHI] & 0xff) << 32) | (uint32_t)s->pc;
-  }
-  if constexpr(DBG) {
-    if(s->gdb) {
-      s->gdb->step_hook(s);         /* gdb RSP: breakpoints / attach / step */
+/* --scsi-disk / --scsi-cdrom: "[ID:]image" targets on the ESP's bus; without an
+ * ID the next free one from first_id up (the initiator, the ESP, is ID 7) */
+static bool attach_scsi(sun4m_t *m, const std::vector<std::string> &specs, scsi_dev_t::type_t t,
+			uint32_t first_id) {
+  uint32_t next = first_id;
+  for(const std::string &spec : specs) {
+    uint32_t id;
+    std::string path = spec;
+    const size_t colon = spec.find(':');
+    if(colon == 1 and spec[0] >= '0' and spec[0] <= '6') {
+      id = spec[0] - '0';
+      path = spec.substr(2);
     }
-    execMips(s);
-  }
-  else {
-    execMipsFast(s);
-  }
-  if(__builtin_expect(--sigpoll == 0, 0)) {
-    sigpoll = 1u << 16;
-    if(g_sig_any) {
-      service_lean_signals(s);
+    else {
+      while(next < 7 and m->scsi[next] != nullptr) {
+	next++;
+      }
+      id = next;
     }
+    if(id >= 7 or m->scsi[id] != nullptr) {
+      fprintf(stderr, "scsi: no free target ID for '%s'\n", spec.c_str());
+      return false;
+    }
+    scsi_dev_t *d = new scsi_dev_t(t, path);
+    if(not d->ok()) {
+      delete d;
+      return false;
+    }
+    m->scsi[id] = d;
+    fprintf(stderr, "scsi: target %u: %s\n", id, path.c_str());
   }
+  return true;
 }
 
-/* the lean main loop; DBG/RING pick the step's instance once, outside the loop */
-template <bool DBG, bool RING>
-static void lean_loop(state_t *s) {
-  uint32_t sigpoll = 1u << 16;
-  if(s->maxicnt == ~(0UL)) {
-    while(not(s->brk)) {
-      lean_step<DBG, RING>(s, sigpoll);
+/* qemu sun4m_hw_init's fw_cfg items and -kernel load: the kernel's segments go
+ * to RAM at vaddr - 0xf0000000 (KERNEL_LOAD_ADDR 0x4000 is where its text
+ * lands), the command line to 0x7ff000.  The values match qemu -M SS-20 with
+ * one CPU and -nographic. */
+static bool setup_fw_cfg(state_t *s, const std::string &kernel, const std::string &append) {
+  static const uint32_t KERNEL_LOAD_ADDR = 0x4000, CMDLINE_ADDR = 0x7ff000, INITRD_LOAD_ADDR = 0x800000;
+  static const uint16_t FW_CFG_SIGNATURE = 0x00, FW_CFG_ID = 0x01, FW_CFG_UUID = 0x02, FW_CFG_RAM_SIZE = 0x03,
+    FW_CFG_NOGRAPHIC = 0x04, FW_CFG_NB_CPUS = 0x05, FW_CFG_MACHINE_ID = 0x06, FW_CFG_KERNEL_ADDR = 0x07,
+    FW_CFG_KERNEL_SIZE = 0x08, FW_CFG_KERNEL_CMDLINE = 0x09, FW_CFG_INITRD_ADDR = 0x0a, FW_CFG_INITRD_SIZE = 0x0b,
+    FW_CFG_BOOT_DEVICE = 0x0c, FW_CFG_BOOT_MENU = 0x0e, FW_CFG_MAX_CPUS = 0x0f, FW_CFG_CMDLINE_SIZE = 0x14,
+    FW_CFG_CMDLINE_DATA = 0x15, FW_CFG_SUN4M_DEPTH = 0x8000, FW_CFG_SUN4M_WIDTH = 0x8001, FW_CFG_SUN4M_HEIGHT = 0x8002;
+  static const uint16_t SS20_MACHINE_ID = 65;
+  fw_cfg_t &f = s->sun4m->fw_cfg;
+  uint8_t uuid[16] = {0};
+  f.add_bytes(FW_CFG_SIGNATURE, "QEMU", 4);
+  f.add_bytes(FW_CFG_UUID, uuid, sizeof(uuid));
+  f.add_i16(FW_CFG_NOGRAPHIC, 1);
+  f.add_i16(FW_CFG_BOOT_MENU, 0);
+  f.add_i32(FW_CFG_ID, 1);                         /* traditional interface, no DMA */
+  f.add_i16(FW_CFG_NB_CPUS, 1);
+  f.add_i16(FW_CFG_MAX_CPUS, 1);
+  f.add_i64(FW_CFG_RAM_SIZE, s->ram_size);
+  f.add_i16(FW_CFG_MACHINE_ID, SS20_MACHINE_ID);
+  f.add_i16(FW_CFG_SUN4M_DEPTH, 8);
+  f.add_i16(FW_CFG_SUN4M_WIDTH, 1024);
+  f.add_i16(FW_CFG_SUN4M_HEIGHT, 768);
+  uint64_t kernel_size = 0;
+  if(not kernel.empty()) {
+    uint32_t entry = 0;
+    auto seg = [&](uint32_t vaddr, const uint8_t *data, uint32_t filesz, uint32_t memsz) {
+      uint32_t pa = vaddr - 0xf0000000u;
+      for(uint32_t i = 0; i < memsz; i++) {
+	s->mem.set<uint8_t>(pa + i, (i < filesz) ? data[i] : 0);
+      }
+    };
+    if(not for_each_elf_segment(kernel.c_str(), seg, &entry, &kernel_size)) {
+      fprintf(stderr, "ss10sim: %s is not a SPARC ELF kernel\n", kernel.c_str());
+      return false;
     }
+    fprintf(stderr, "ss10sim: kernel %s, %llu bytes, entry 0x%x\n", kernel.c_str(),
+	    static_cast<unsigned long long>(kernel_size), entry);
   }
-  else {                         /* -m given: also stop at maxicnt */
-    while(not(s->brk) and s->icnt < s->maxicnt) {
-      lean_step<DBG, RING>(s, sigpoll);
+  f.add_i32(FW_CFG_KERNEL_ADDR, KERNEL_LOAD_ADDR);
+  f.add_i32(FW_CFG_KERNEL_SIZE, static_cast<uint32_t>(kernel_size));
+  if(not append.empty()) {
+    std::string c = append.substr(0, 4095);    /* pstrcpy into one page */
+    for(size_t i = 0; i <= c.size(); i++) {
+      s->mem.set<uint8_t>(CMDLINE_ADDR + i, (i < c.size()) ? static_cast<uint8_t>(c[i]) : 0);
     }
+    f.add_i32(FW_CFG_KERNEL_CMDLINE, CMDLINE_ADDR);
+    f.add_bytes(FW_CFG_CMDLINE_DATA, append.c_str(), append.size() + 1);
+    f.add_i32(FW_CFG_CMDLINE_SIZE, static_cast<uint32_t>(append.size() + 1));
   }
+  else {
+    f.add_i32(FW_CFG_KERNEL_CMDLINE, 0);
+    f.add_i32(FW_CFG_CMDLINE_SIZE, 0);
+  }
+  f.add_i32(FW_CFG_INITRD_ADDR, INITRD_LOAD_ADDR);
+  f.add_i32(FW_CFG_INITRD_SIZE, 0);
+  f.add_i16(FW_CFG_BOOT_DEVICE, 'c');
+  return true;
+}
+
+/* Would qemu end the TB holding insn by returning to its main loop (rather than
+ * jumping straight to the next TB)?  qemu sparc translate.c: wr %psr
+ * (DISAS_EXIT), rett and alternate-space stores/ldstub through a helper ASI
+ * (dynamic npc).  Only used to mirror qemu's -icount exec log. */
+static bool qemu_tb_exits(uint32_t insn) {
+  if((insn >> 30) == 2) {
+    uint32_t op3 = (insn >> 19) & 0x3f;
+    return op3 == 0x31 or op3 == 0x39;          /* wr %psr, rett */
+  }
+  if((insn >> 30) == 3) {
+    uint32_t op3 = (insn >> 19) & 0x3f;
+    uint32_t asi = (insn >> 5) & 0xff;
+    bool alt_store = (op3 >= 0x14 and op3 <= 0x17) or op3 == 0x1d;
+    bool direct = asi == 0xa or asi == 0xb or asi == 0x20 or asi == 0x1c or asi == 0x17 or asi == 0x1f;
+    return alt_store and not ((insn >> 13) & 1) and not direct;
+  }
+  return false;
+}
+
+/* sun4m system reset (qemu: sparc_cpu_reset_hold + every device's reset): RAM,
+ * the PROM and NVRAM survive.  The CPU clears its registers, PSR (S = PS = 1,
+ * ET = EF = 0, PIL 0), FSR, FP registers and TBR, sets WIM = 1, restarts at
+ * PC 0 and re-enters boot mode with the MMU off; the other MMU registers keep
+ * their values.  icnt (time) keeps counting. */
+static void system_reset(state_t *s) {
+  memset(s->r, 0, sizeof(s->r));
+  memset(s->f, 0, sizeof(s->f));
+  memset(s->asr, 0, sizeof(s->asr));
+  s->icc_n = s->icc_z = s->icc_v = s->icc_c = false;
+  s->ef = false;
+  s->s = true;
+  s->ps = true;
+  s->et = false;
+  s->pil = 0;
+  s->cwp = 0;
+  s->wim = 1;
+  s->tbr = 0;
+  s->y = 0;
+  s->fsr = 0;
+  s->fq_addr = s->fq_insn = 0;
+  s->mmu_ctrl = (s->mmu_ctrl & ~(MCR_E | MCR_NF)) | MCR_BMODE;
+  s->pc = 0;
+  s->npc = 4;
+  s->error_mode = false;
+  s->sun4m->reset_devices(s->sun4m->now_ns(s));
+  s->sun4m->update_irqs(s);
 }
 
 int main(int argc, char *argv[]) {
-  bool retiretrace_signal = false;
-  std::string filename, arcs, retire_name, start_pc, disk, prom, disk_delta, ckpt_at, ckpt_out, restore_name;
-  std::string cosim;   /* "server"|"client": lockstep co-sim vs the JIT sim */
-  std::string cpu;
-  bool disk_write = false;   /* --disk-write: write straight through to --disk (no COW) */
-  uint64_t maxinsns = ~(0UL);
-  uint64_t ckpt_icnt = 0;
-  uint64_t ckpt_every = 0, ckpt_start = 0;
-  bool virt = false;
-  bool newport = false;       /* --newport: SGI Newport graphics board */
-  bool sdl_out = false;       /* --sdl: live window for the Newport display */
-  uint64_t bbv_interval = 0;
-  std::string bbv_out;
-  std::string brtrace_out;
-  int gdb_port = 0;
+  namespace po = boost::program_options;
+  std::string filename, rom, nvram, pctrace;
+  uint32_t ram_mb = 256;
+  uint32_t icount_shift = 4;
+  uint64_t trace_from = ~0ULL;
+  int64_t rtc_base = 1767225600;
+  uint64_t ckpt_icnt = ~0ULL;
+  std::string ckpt_pc_s, ckpt_out = "ss10sim.ckpt", restore;
+  std::string kernel, append;
+  std::vector<std::string> scsi_disks, scsi_cdroms;
+  std::string console_input;
+  uint64_t console_input_at = 0;
+  uint64_t max_icnt = ~0ULL;
+  bool user = false, trace = false, dump = false, with_sun4m = false;
   try {
-    po::options_description desc("options");
+    po::options_description desc("Options");
     desc.add_options()
-      ("file,f",    po::value<std::string>(&filename), "ELF kernel image")
-      ("arcs",      po::value<std::string>(&arcs),     "ARCS firmware blob (loaded at PA 0x1000)")
-      ("retiretrace", po::value<std::string>(&retire_name), "emit boost retire_trace for rv64analyzer")
-      ("retiretrace-signal", po::bool_switch(&retiretrace_signal), "with --retiretrace: start OFF; kill -URG <pid> starts recording, kill -VTALRM <pid> stops and writes <retiretrace>.<n>")
-      ("maxicnt,m", po::value<uint64_t>(&maxinsns)->default_value(~(0UL)), "max instructions")
-      ("start-pc", po::value<std::string>(&start_pc)->default_value(""), "fake-BIOS: start PC e.g. 0xa0003000 (skips pseudo_bios + arcs patch; firmware does the handoff)")
-      ("disk",     po::value<std::string>(&disk),     "SCSI disk image for HD0 (raw, or read-only qcow2 -- e.g. irix65.img / irix65.qcow2)")
-      ("disk-delta", po::value<std::string>(&disk_delta), "persistent COW sidecar for --disk: writes survive across runs (image stays read-only); flushed on exit + SIGUSR2")
-      ("disk-write", po::bool_switch(&disk_write), "write straight through to --disk (O_RDWR, no COW) -- the image IS modified in place, like the FPGA; lets IRIX reconfigure persist. Overrides --disk-delta")
-      ("prom",     po::value<std::string>(&prom),     "flat PROM firmware blob loaded at phys 0x1fc00000 (e.g. henry_arcs.bin); use with --start-pc 0xbfc00000")
-      ("checkpoint-at",  po::value<std::string>(&ckpt_at)->default_value(""),  "dump a full-state checkpoint when this PC (hex) first retires, then exit")
-      ("checkpoint-icnt", po::value<uint64_t>(&ckpt_icnt)->default_value(0),    "dump a full-state checkpoint when icnt first reaches this value, then exit")
-      ("bbv-interval", po::value<uint64_t>(&bbv_interval)->default_value(0), "SimPoint basic-block vectors: one per N instructions (0 = off)")
-      ("bbv-out", po::value<std::string>(&bbv_out)->default_value("run.bbv"), "BBV output file (SimPoint .bb format)")
-      ("brtrace", po::value<std::string>(&brtrace_out), "oracle branch trace for r9999 ORACLE_BP: one record per retired control transfer (predecode.sv classes)")
-      ("virt", po::bool_switch(&virt), "r9999-virt device-free platform: flat RAM at PA 0 -- no IP22 memory alias, no device window")
-      ("newport", po::bool_switch(&newport), "SGI Newport (XL24; NEWPORT_XL8=1 for the 8-bit XL8) in the GIO graphics slot; NEWPORT_PPM=<file> dumps the display at exit")
-      ("sdl", po::bool_switch(&sdl_out), "live SDL window for the Newport display (implies --newport)")
-      ("checkpoint-every", po::value<uint64_t>(&ckpt_every)->default_value(0), "uniform sampling: dump a checkpoint every N instructions (to <checkpoint-out>.<icnt>) and keep running")
-      ("checkpoint-start", po::value<uint64_t>(&ckpt_start)->default_value(0), "with --checkpoint-every: first dump at this icnt (default N)")
-      ("checkpoint-out", po::value<std::string>(&ckpt_out)->default_value("checkpoint.bin"), "checkpoint output file for --checkpoint-at")
-      ("restore", po::value<std::string>(&restore_name)->default_value(""), "restore a full-state checkpoint (loadState) and continue from it")
-      ("gdb", po::value<int>(&gdb_port)->default_value(0), "listen for gdb on this TCP port (RSP stub); boots full-speed until a client attaches")
-      ("cosim", po::value<std::string>(&cosim), "lockstep co-sim: 'server' (golden) or 'client'; run both sims with DETTIME=1")
-      ("cpu", po::value<std::string>(&cpu)->default_value("r4400"), "CPU model: r4400 (MIPS III, matches r9999) or r5000 (R5000PC Indy: MIPS IV, 32K+32K L1, no L2)");
+      ("help", "print help")
+      ("file,f", po::value<std::string>(&filename), "sparc elf binary")
+      ("rom,r", po::value<std::string>(&rom), "sun4m (SS-20) boot prom image: reset into it instead of an elf")
+      ("ram", po::value<uint32_t>(&ram_mb), "sun4m RAM size in MB (with --rom)")
+      ("icount-shift", po::value<uint32_t>(&icount_shift), "sun4m time: 2^N ns per instruction (qemu -icount shift=N; default 4)")
+      ("rtc-base", po::value<int64_t>(&rtc_base), "sun4m RTC at time 0, seconds since the epoch (default 2026-01-01T00:00:00 UTC; qemu -rtc base=...,clock=vm)")
+      ("nvram", po::value<std::string>(&nvram), "sun4m M48T08 nvram image (with --rom)")
+      ("sun4m", po::bool_switch(&with_sun4m), "run the elf with the sun4m devices attached (RAM = --ram)")
+      ("pctrace", po::value<std::string>(&pctrace), "write every executed pc (hex, one per line) to this file")
+      ("maxicnt,m", po::value<uint64_t>(&max_icnt), "max instructions to execute")
+      ("user,u", po::bool_switch(&user), "linux user-mode emulation (syscalls + window spill/fill)")
+      ("trace,t", po::bool_switch(&trace), "print every executed instruction")
+      ("trace-from", po::value<uint64_t>(&trace_from), "print every executed instruction from this icnt on")
+      ("kernel", po::value<std::string>(&kernel), "with --rom openbios-sparc32: a Linux vmlinux, booted through fw_cfg (qemu -kernel)")
+      ("append", po::value<std::string>(&append), "with --kernel: the kernel command line (qemu -append)")
+      ("scsi-disk", po::value<std::vector<std::string>>(&scsi_disks)->composing(),
+       "[ID:]image: a SCSI disk on the ESP (default ID 0, then 1, ...; written in place)")
+      ("scsi-cdrom", po::value<std::vector<std::string>>(&scsi_cdroms)->composing(),
+       "[ID:]image: a SCSI CD-ROM on the ESP (default ID 6, as an SS-20's)")
+      ("console-input", po::value<std::string>(&console_input),
+       "file (or - for stdin) typed into ttya, one byte whenever its receiver is empty; \\n is sent as \\r")
+      ("console-input-at", po::value<uint64_t>(&console_input_at),
+       "with --console-input: start typing at this icount (so start-up code cannot swallow it)")
+      ("checkpoint-at", po::value<uint64_t>(&ckpt_icnt), "write a checkpoint (--checkpoint-out) when icnt reaches this, then exit")
+      ("checkpoint-at-pc", po::value<std::string>(&ckpt_pc_s), "write a checkpoint the first time this pc is about to execute, then exit")
+      ("checkpoint-out", po::value<std::string>(&ckpt_out), "checkpoint file to write (default ss10sim.ckpt)")
+      ("restore", po::value<std::string>(&restore), "start from a checkpoint (after the --rom/--kernel setup it replaces)")
+      ("dump,d", po::bool_switch(&dump), "dump register state at exit");
     po::variables_map vm;
     po::store(po::parse_command_line(argc, argv, desc), vm);
     po::notify(vm);
-  } catch(...) { std::cerr << "bad args\n"; return 1; }
-  if(cpu == "r5000") {
-    globals::cpu_r5000 = true;
+    if(vm.count("help") or (filename.empty() and rom.empty())) {
+      std::cout << desc << "\n";
+      return 1;
+    }
   }
-  else if(cpu != "r4400") {
-    std::cerr << "--cpu must be r4400 or r5000\n";
+  catch(po::error &e) {
+    std::cerr << "command line error : " << e.what() << "\n";
     return 1;
   }
 
-  //if(filename.empty()) { std::cerr << "need --file <kernel>\n"; return 1; }
+  sparse_mem mem;
+  state_t *s = new state_t(mem);
+  s->user_emu = user;
+  initState(s);
+  if(not rom.empty()) {
+    /* sun4m power-on: PC 0 / nPC 4 in Viking boot mode; WIM=1 and PS=1 as qemu
+     * resets them (architecturally undefined), so traces line up */
+    s->sun4m = new sun4m_t();
+    s->sun4m->ns_shift = icount_shift;
+    s->sun4m->rtc_base = rtc_base;
+    if(not s->sun4m->load_prom(rom.c_str())) {
+      return 1;
+    }
+    if(not nvram.empty() and not s->sun4m->load_nvram(nvram.c_str())) {
+      return 1;
+    }
+    if(not attach_scsi(s->sun4m, scsi_disks, scsi_dev_t::type_t::disk, 0) or
+       not attach_scsi(s->sun4m, scsi_cdroms, scsi_dev_t::type_t::cdrom, 6)) {
+      return 1;
+    }
+    s->ram_size = static_cast<uint64_t>(ram_mb) << 20;
+    if(not setup_fw_cfg(s, kernel, append)) {
+      return 1;
+    }
+    s->mmu_ctrl |= MCR_BMODE;
+    s->pc = 0;
+    s->npc = 4;
+    s->wim = 1;
+    s->ps = true;
+  }
+  else {
+    load_elf(filename.c_str(), s);
+    if(with_sun4m) {
+      s->sun4m = new sun4m_t();
+      s->ram_size = static_cast<uint64_t>(ram_mb) << 20;
+    }
+  }
+  if(not restore.empty() and not load_checkpoint(restore.c_str(), s)) {
+    return 1;
+  }
+  int con_fd = -1;
+  if(not console_input.empty()) {
+    con_fd = (console_input == "-") ? 0 : open(console_input.c_str(), O_RDONLY);
+    if(con_fd < 0) {
+      fprintf(stderr, "ss10sim: cannot open --console-input %s\n", console_input.c_str());
+      return 1;
+    }
+  }
+  const bool have_ckpt_pc = not ckpt_pc_s.empty();
+  const uint32_t ckpt_pc = have_ckpt_pc ? static_cast<uint32_t>(std::stoul(ckpt_pc_s, nullptr, 0)) : 0;
+  FILE *pcfp = pctrace.empty() ? nullptr : fopen(pctrace.c_str(), "w");
+  if(trace) {
+    trace_from = 0;
+  }
+  if(trace_from != ~0ULL) {
+    initCapstone();
+  }
 
-  sparse_mem *sm = new sparse_mem();
-  /* CACHE_MODEL: model the R4x00/Indy write-back cache (32B lines) IRIX is built
-   * for, so cache-coherence bugs the perfectly-coherent ISS hides become visible.
-   * Off by default -> plain ISS behavior. */
-#ifdef ENABLE_CACHE_MODEL
-  if(getenv("CACHE_MODEL")) {
-    g_cmodel = new cache_model(*sm);
-    g_stale_detect = getenv("STALE_DETECT") != nullptr;   /* flag stale cached reads */
-    fprintf(stderr, "[cache_model] ENABLED: 32B write-back L1 D-cache (%u sets)%s\n",
-            cache_model::L1_SETS, g_stale_detect ? " + STALE_DETECT" : "");
-  }
-  if(getenv("WSPROFILE")) {
-    g_wsprof = new ws_profile();
-    fprintf(stderr, "[ws_profile] ENABLED: data working-set curves (marker VA 0x30000000 reset / 0x30001000 dump)\n");
-  }
-#else
-  /* the D-cache model and ws profiler cost a cache_active update on every translated
-   * access: compiled out unless built with -DENABLE_CACHE_MODEL */
-  if(getenv("CACHE_MODEL") || getenv("WSPROFILE")) {
-    fprintf(stderr, "CACHE_MODEL / WSPROFILE need a build with -DENABLE_CACHE_MODEL\n");
-    exit(1);
-  }
-#endif
-  s = new state_t(*sm);
-  s->maxicnt = maxinsns;
-  s->mc  = new sgi_mc(s);
-  s->hpc = new sgi_hpc(s);
-  s->scc = new sgi_scc(s);
-  /* always present the WD33C93 (empty bus if no --disk) so the sgiwd93 probe's reset
-   * completes -- otherwise a diskless Linux boot hangs polling ASR_INT. */
-  s->scsi = new sgi_scsi(s, disk, disk_delta, disk_write);
-  s->seeq = new sgi_seeq(s);   /* Seeq 8003 ethernet; tap via env SEEQ_TAP=<ifname> */
-  newport_sdl *np_disp = nullptr;
-  if(!virt && (newport || sdl_out)) {
-    s->np = new sgi_newport(s);  /* Newport graphics in the GIO graphics slot */
-    s->ps2 = new sgi_ps2(s);     /* and the keyboard/mouse that go with it */
-    if(sdl_out) {
-      np_disp = new newport_sdl(s->np, s);
-      if(np_disp->ok()) {
-        s->np->attach_display(np_disp);
+  uint64_t halt_warps = 0;
+  bool timer_fired = false;
+  bool prev_exited = true;
+  bool ckpt_armed = false;
+  while(not s->brk and s->icnt < max_icnt) {
+    /* typed console input: a byte when ttya's receiver is empty (checked every
+     * 4K instructions; poll() so an interactive stdin never blocks the run) */
+    if(con_fd >= 0 and s->sun4m and (s->icnt & 4095) == 0 and s->icnt >= console_input_at and
+       s->sun4m->serial.can_receive(1)) {
+      struct pollfd pfd = {con_fd, POLLIN, 0};
+      uint8_t ch;
+      if(poll(&pfd, 1, 0) > 0) {
+	if(read(con_fd, &ch, 1) == 1) {
+	  s->sun4m->serial.receive(1, (ch == '\n') ? '\r' : ch);
+	  s->sun4m->update_irqs(s);
+	}
+	else {
+	  if(con_fd != 0) {
+	    close(con_fd);
+	  }
+	  con_fd = -1;
+	}
       }
     }
-  }
-  sm->st = s;
-  sm->route_devices = !virt;   /* virt: no IP22 low-memory alias, no device window */
-
-  initState(s);                    /* CP0 reset state: PRId, Config, SR, Random */
-  if(not(filename.empty())) {
-    load_elf(filename.c_str(), s);   /* sets s->pc to the entry */
-  }
-
-  /* IRIX /unix entry ABI (ARCS): a0=argc, a1=argv, a2=envp. The pseudo-BIOS
-   * synthesizes the real argv/envp handoff sash gives /unix (the kernel's
-   * getargs/_envirn read these; a1=a2=0 made getargs derail -- MAME Q5). */
-  /* fake-BIOS (--start-pc): the arcs_irix boot stub does the argv/envp handoff
-   * itself (matching the FPGA), so skip the C++ pseudo-BIOS. */
-  if(start_pc.empty()) install_pseudo_bios(s, sm);
-
-  if(!arcs.empty()) {
-    int fd = open(arcs.c_str(), O_RDONLY);
-    if(fd < 0) { std::cerr << "cannot open arcs " << arcs << "\n"; return 1; }
-    struct stat st; fstat(fd, &st);
-    void *buf = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    /* Route through the MC System Memory Alias (get_raw_ptr applies mc_alias):
-     * the kernel reads the SPB/romvec via kseg1 0xa000xxxx -> PA 0x1xxx, which
-     * the alias remaps to DRAM 0x0800_1xxx.  A raw memcpy to PA 0x1000 would land
-     * where nothing reads it (the FSBL path stages the SPB via alias-routed
-     * stores, so it stayed consistent; this C++ loader must match). */
-    memcpy(sm->get_raw_ptr(0x1000), buf, st.st_size);
-    std::cerr << "loaded ARCS firmware (" << st.st_size << " bytes) at PA 0x1000 (alias-routed)\n";
-    munmap(buf, st.st_size); close(fd);
-
-    /* Patch the ARCS GetEnvironmentVariable stub to return a real "eaddr" string.
-     * The r9999-irix arcs_irix blob's stub_getenv returns NULL; with the real TLB
-     * enabled, init_sysid then calls etoh(NULL) -> load from VA 0 -> TLB miss and
-     * derail (the old 1:1 va2pa masked this by reading PA 0 = zeros, giving a
-     * harmless all-zero MAC). Real PROM firmware returns the EEPROM eaddr, so we
-     * inject one. Layout: stub_getenv @ blob offset 0xe68; the eaddr ASCII string
-     * is placed at blob offset 0xf00 (past the 3840-byte blob, still low RAM).
-     * Code (big-endian, as fetched+bswapped): lui v0,0xa000; ori v0,v0,0x1f00;
-     * jr ra; nop.  v0 -> 0xa0001f00 (kseg1, uncached).  Only applies to the IRIX
-     * blob (stub_getenv @ 0xe68; blob is 0xf00 bytes); the Linux arcs_fw blob is
-     * far smaller (752 bytes), so guard on size to avoid clobbering a small blob. */
-    if(start_pc.empty() && st.st_size >= 0xe78) {
-      uint8_t *base = sm->get_raw_ptr(0x1000);
-      const char *eaddr = "08:00:69:12:34:56";
-      memcpy(base + 0xf00, eaddr, strlen(eaddr) + 1);
-      /* MIPS BE instruction words, written byte-wise as big-endian */
-      auto put_be = [&](uint32_t off, uint32_t insn) {
-        base[off+0] = (insn >> 24) & 0xff; base[off+1] = (insn >> 16) & 0xff;
-        base[off+2] = (insn >>  8) & 0xff; base[off+3] = (insn >>  0) & 0xff;
-      };
-      put_be(0xe68, 0x3c02a000);   /* lui   v0, 0xa000      */
-      put_be(0xe6c, 0x34421f00);   /* ori   v0, v0, 0x1f00  */
-      put_be(0xe70, 0x03e00008);   /* jr    ra              */
-      put_be(0xe74, 0x00000000);   /* nop                   */
+    if(s->sun4m and s->icnt >= s->sun4m->next_event_icnt) {
+      s->sun4m->timer_event(s);
+      timer_fired = true;
     }
-  }
-
-  /* PROM firmware (henry_arcs.bin): a self-contained FSBL linked at the CPU
-   * reset vector 0xBFC00000 (phys 0x1fc00000).  It copies its SPB to phys 0x1000,
-   * stages argv/envp, reads the kernel entry from the kentry slot @0xBFC00008
-   * (default 0x88005960 = the IRIX /unix entry), and jumps to it.  Load the flat
-   * blob into the PROM region and boot via --start-pc 0xbfc00000. */
-  if(!prom.empty()) {
-    int fd = open(prom.c_str(), O_RDONLY);
-    if(fd < 0) { std::cerr << "cannot open prom " << prom << "\n"; return 1; }
-    struct stat st; fstat(fd, &st);
-    void *buf = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    memcpy(sm->mem + 0x1fc00000, buf, st.st_size);
-    std::cerr << "loaded PROM firmware (" << st.st_size << " bytes) at phys 0x1fc00000\n";
-    munmap(buf, st.st_size); close(fd);
-
-    /* Patch the kentry slot @0xBFC00008 (phys 0x1fc00008) with the loaded
-     * kernel's ELF entry, big-endian.  henry_arcs.S hardcodes 0x88005960 (the
-     * IRIX /unix entry) as the default and expects "the driver/TB" to patch the
-     * slot per kernel; the FSBL jumps there blindly (jr $k0).  Without this,
-     * Linux (entry 0x88325eb8) jumps to the IRIX entry and derails.  s->pc still
-     * holds the ELF entry here (the --start-pc override runs below). */
-    /* Only with a kernel: a real SGI PROM has code at 0xBFC00008. */
-    if(!filename.empty()) {
-      uint32_t kentry = (uint32_t)s->pc;
-      uint8_t *kslot = (uint8_t*)sm->mem + 0x1fc00008;
-      kslot[0] = (kentry >> 24) & 0xff; kslot[1] = (kentry >> 16) & 0xff;
-      kslot[2] = (kentry >>  8) & 0xff; kslot[3] = (kentry >>  0) & 0xff;
-      std::cerr << "patched kentry slot @0xbfc00008 = " << std::hex << kentry << std::dec << "\n";
-    }
-  }
-
-  /* fake-BIOS: start at the firmware boot stub (e.g. arcs_boot @ 0xa0003000);
-   * the stub prints the SCC heartbeat, builds argv/envp, and jumps to /unix. */
-  if(!start_pc.empty()) {
-    s->pc = (int64_t)(int32_t)(uint32_t)strtoul(start_pc.c_str(), nullptr, 0);
-    std::cerr << "fake-bios: start pc = " << std::hex << (uint32_t)s->pc << std::dec << "\n";
-  }
-
-  if(!restore_name.empty()) {
-    loadState(*s, restore_name);
-    xctx_update(s);
-    std::cerr << "restored checkpoint " << restore_name << " -> pc=" << std::hex
-              << (uint32_t)s->pc << " icnt=" << std::dec << s->icnt << "\n";
-  }
-
-  retire_trace rt;
-  int rt_windows = 0;
-  if(!retire_name.empty()) {
-    globals::retire_log = &rt;
-    globals::trace_retirement = !retiretrace_signal;   /* signal mode: wait for SIGURG */
-  }
-
-  const char *pctrace = getenv("PCTRACE");
-  uint64_t pcsample = pctrace ? strtoull(pctrace, nullptr, 0) : 0;
-  const char *fw = getenv("FINEWIN");   /* "lo:hi" icnt window for per-insn PC trace */
-  uint64_t flo=0, fhi=0;
-  if(fw) { sscanf(fw, "%lu:%lu", &flo, &fhi); }
-  const char *a1p = getenv("A1PROBE"); /* dump a0/a1/a2 first few times pc hits this addr */
-  uint32_t probe_pc = a1p ? (uint32_t)strtoull(a1p, nullptr, 0) : 0;
-  const char *a1after = getenv("A1PROBE_AFTER"); /* only start probing past this icnt */
-  uint64_t probe_after = a1after ? strtoull(a1after, nullptr, 0) : 0;
-  int probe_hits = 0;
-  uint32_t ckpt_pc = ckpt_at.empty() ? 0 : (uint32_t)strtoull(ckpt_at.c_str(), nullptr, 0);
-  uint64_t ckpt_next = ckpt_start ? ckpt_start : ckpt_every;
-  /* PCTRACEOUT=<file>: co-sim trace -- one hex virtual PC per retired
-   * instruction (delay slots included; emitted inside execMips), starting when
-   * execution first reaches PCTRACE_START (default kernel entry 0x88005960). */
-  const char *pcto = getenv("PCTRACEOUT");
-  if(pcto) globals::pctrace = fopen(pcto, "w");
-  const char *pcs = getenv("PCTRACE_START");
-  if(pcs) globals::pctrace_start = (uint32_t)strtoull(pcs, nullptr, 0);
-  /* VALTRACE=<file>: per-USER-instruction "pc dst val" co-sim value trace
-   * (dst = the GPR changed by the instruction, -1 if none; via before/after diff). */
-  const char *vto = getenv("VALTRACE");
-  FILE *valt = vto ? fopen(vto, "w") : nullptr;
-  const bool valt_all = getenv("VALTRACE_ALL") != nullptr;  /* trace all insns (kernel co-sim) */
-  /* DFTRACE=<file>: per be-region (0x0c-0x10M) user instruction, emit build_dataflow.py's
-   * 22-byte record <Q pc><I inst><B valid><B dst><Q val> for the reg+mem def-use slice. */
-  const char *dfto = getenv("DFTRACE");
-  FILE *dft = dfto ? fopen(dfto, "wb") : nullptr;
-  uint64_t dflo = 0, dfhi = ~0ULL;   /* DFLO/DFHI: emit only for icnt in [dflo,dfhi) */
-  { const char *e; if((e=getenv("DFLO"))) dflo=strtoull(e,0,0); if((e=getenv("DFHI"))) dfhi=strtoull(e,0,0); }
-  uint64_t gprsnap[32];
-  
-  signal(SIGUSR1, on_sigusr1);   /* kill -USR1 <pid> -> dump current IRIX process */
-  signal(SIGUSR2, on_sigusr2);   /* kill -USR2 <pid> -> flush --disk-delta sidecar */
-  if(retiretrace_signal && !retire_name.empty()) {
-    signal(SIGURG, on_sigurg);       /* kill -URG <pid>    -> start the retire trace */
-    signal(SIGVTALRM, on_sigvtalrm); /* kill -VTALRM <pid> -> stop + write it */
-    fprintf(stderr, "[retiretrace] signal mode: kill -URG %d to start, kill -VTALRM %d to stop+write\n",
-            (int)getpid(), (int)getpid());
-  }
-  if(gdb_port) s->gdb = new gdb_stub(gdb_port);
-#ifdef ENABLE_COSIM
-  if(cosim == "server")      cosim_init(true);
-  else if(cosim == "client") cosim_init(false);
-  const char *mnenv = getenv("COSIM_MEMN");
-  uint64_t cosim_memn = mnenv ? strtoull(mnenv, nullptr, 0) : 4000000;  /* co-sim RAM-hash interval */
-  const char *msenv = getenv("COSIM_MEMSTART");
-  uint64_t cosim_memstart = msenv ? strtoull(msenv, nullptr, 0) : 0;
-#else
-  /* lockstep co-sim costs a call + CP0 snapshot per instruction: compiled out unless
-   * built with -DENABLE_COSIM */
-  if(!cosim.empty()) {
-    fprintf(stderr, "--cosim needs a build with -DENABLE_COSIM\n");
-    return -1;
-  }
-#endif
-  { const char *e;   /* memory-op watchpoints (see sparse_mem.hh) */
-    if((e = getenv("WATCHPA")))   g_watch_pa   = (uint32_t)strtoull(e, 0, 0);
-    if((e = getenv("WATCHLDPC"))) g_watch_ldpc = (uint32_t)strtoull(e, 0, 0);
-    if((e = getenv("WATCH_LO")))  g_watch_lo   = strtoull(e, 0, 0);
-    if((e = getenv("WATCH_HI")))  g_watch_hi   = strtoull(e, 0, 0);
-  }
-  sparse_mem_update_hooks();   /* after every hook global above is set */
-
-  double t0 = timestamp();
-  bbv_log *bbv = bbv_interval ? new bbv_log(bbv_interval) : nullptr;
-  brtrace_log *brt = brtrace_out.empty() ? nullptr : new brtrace_log(brtrace_out.c_str());
-
-#ifdef __LEAN_BUILD__
-  static const bool lean = true;
-#else
-  static const bool lean = false;
-#endif
-  
-  /* --gdb needs the DBG instance: the lean fast path does not service the stub */
-  globals::exec_dbg = exec_debug_requested() or not(retire_name.empty()) or (globals::pctrace != nullptr) or (gdb_port != 0);
-  if(const char *pr = getenv("PCRING")) {
-    const int lg = atoi(pr);
-    g_pcring_mask = (1ULL << lg) - 1;
-    g_pcring = new uint64_t[g_pcring_mask + 1]();
-    fprintf(stderr, "[pcring] %llu entries; kill -USR1 %d to write pcring.<n>.bin\n",
-            (unsigned long long)(g_pcring_mask + 1), (int)getpid());
-  }
-  if(lean) {
-    if(globals::exec_dbg) {
-      if(g_pcring) {
-        lean_loop<true, true>(s);
+    if(s->sun4m and s->sun4m->cpu_halted) {
+      /* qemu sparc_cpu_has_work: wake when any interrupt level is requested and
+       * traps are enabled, whatever the PIL (Linux idles with PIL 15 and takes
+       * the interrupt after it lowers it) */
+      if(s->et and s->irl != 0) {
+	s->sun4m->cpu_halted = false;
+	halt_warps = 0;
       }
       else {
-        lean_loop<true, false>(s);
+	timer_fired = true;
+	if(not s->sun4m->warp_to_next_event(s) or ++halt_warps > 1000000) {
+	  intctl_t &ic = s->sun4m->intctl;
+	  fprintf(stderr, "ss10sim: CPU halted for good at pc 0x%x: et %d pil %u irl %u, intctl master pending %08x "
+		  "disabled %08x, cpu0 pending %08x, timer limits sys %llx cpu0 %llx, mode %x\n",
+		  s->pc, s->et, s->pil, s->irl, ic.master_pending, ic.master_disabled, ic.slave_pending[0],
+		  static_cast<unsigned long long>(s->sun4m->ctr[0].limit),
+		  static_cast<unsigned long long>(s->sun4m->ctr[1].limit), s->sun4m->ctr_user_mode);
+	  break;
+	}
+	continue;
       }
     }
-    else {
-      if(g_pcring) {
-        lean_loop<false, true>(s);
+    /* trace the instructions that execute: a pending interrupt is taken before
+     * the instruction at pc is fetched.  Matching qemu's -icount exec log, the
+     * pc is also traced when a timer event fired at this boundary and the last
+     * TB chained into the next one: qemu has then already started (and logged)
+     * the next one-insn TB when the deadline stops it, and re-executes it after
+     * the interrupt is handled.  A TB that returned to qemu's main loop (see
+     * qemu_tb_exits, a trap, a halt) is followed by no such entry. */
+    if((timer_fired and not prev_exited) or not (s->et and s->irl != 0 and (s->irl == 15 or s->irl > s->pil))) {
+      if(pcfp) {
+        fprintf(pcfp, "%08x\n", s->pc);
       }
-      else {
-        lean_loop<false, false>(s);
-      }
-    }
-  }
-
-  while(not(s->brk == 0) and not(s->icnt < s->maxicnt) and not(lean)) {
-    /* BECOUNT: tally userspace + be-region (0x0c-0x10M text/libc) dynamic instrs; print at the crash pc. */
-    { static const bool g_bec = getenv("BECOUNT") != nullptr;
-      static uint64_t g_us=0, g_be=0; static uint64_t g_be_first_icnt=0;
-      if(g_bec) { uint32_t p=(uint32_t)s->pc;
-        if(p < 0x80000000u) g_us++;
-        if(p >= 0x0c000000u && p < 0x10000000u) { if(!g_be) g_be_first_icnt=s->icnt; g_be++; }
-        if(ckpt_pc && p==ckpt_pc)
-          fprintf(stderr,"[becount] crash pc=%08x sys_icnt=%lu | userspace=%lu | be_region(0c-10M)=%lu (first be icnt=%lu -> span=%lu)\n",
-                  p,(unsigned long)s->icnt,(unsigned long)g_us,(unsigned long)g_be,
-                  (unsigned long)g_be_first_icnt,(unsigned long)(s->icnt-g_be_first_icnt)); } }
-    if(g_sig_any) {
-      g_sig_any = 0;
-      if(g_sig_dumpproc)   { g_sig_dumpproc = 0;   dump_current_process(s);   tlbpm_report();
-        globals::asidpc_armed = !globals::asidpc_armed;
-        fprintf(stderr, "[asidpc] armed=%d icnt=%lu\n", globals::asidpc_armed, (unsigned long)s->icnt); }
-      if(g_sig_flushdelta) { g_sig_flushdelta = 0; if(s->scsi) s->scsi->flush_delta(); }
-      if(g_sig_trace_on) {
-        g_sig_trace_on = 0;
-        if(globals::retire_log) {
-          globals::trace_retirement = true;
-          fprintf(stderr, "[retiretrace] START at icnt=%llu pc=%08x\n", (unsigned long long)s->icnt, (uint32_t)s->pc);
-        }
-      }
-      if(g_sig_trace_off) {
-        g_sig_trace_off = 0;
-        if(globals::retire_log && globals::trace_retirement) {
-          globals::trace_retirement = false;
-          const std::string out = retire_name + "." + std::to_string(rt_windows++);
-          std::ofstream ofs(out, std::ios::binary);
-          boost::archive::binary_oarchive oa(ofs);
-          oa << rt;
-          fprintf(stderr, "[retiretrace] STOP at icnt=%llu: wrote %zu records to %s\n",
-                  (unsigned long long)s->icnt, rt.get_records().size(), out.c_str());
-          rt.get_records().clear();
-          rt.tip.clear();
-        }
+      if(s->icnt >= trace_from) {
+        uint32_t inst = 0;
+        debug_fetch(s, s->pc, &inst);
+        fprintf(stderr, "%08x %08x cwp %u pil %u irl %u et %d icnt %llu : %s\n", s->pc, inst, s->cwp, s->pil, s->irl,
+		s->et, static_cast<unsigned long long>(s->icnt), getAsmString(inst, s->pc).c_str());
       }
     }
-    if(pcsample && (s->icnt % pcsample) == 0)
-      fprintf(stderr, "[pc] icnt=%lu pc=%08x ra=%08x sp=%08x\n",
-              (unsigned long)s->icnt, (uint32_t)s->pc, (uint32_t)s->gpr[31], (uint32_t)s->gpr[29]);
-    if(fw && s->icnt>=flo && s->icnt<fhi)
-      fprintf(stderr, "[fine] icnt=%lu pc=%08x\n", (unsigned long)s->icnt, (uint32_t)s->pc);
-    if(probe_pc && s->icnt >= probe_after && (uint32_t)s->pc == probe_pc) {
-      fprintf(stderr, "[probe] icnt=%lu pc=%08x a0=%016lx a1=%016lx a2=%016lx a3=%016lx a4=%016lx a5=%016lx\n",
-              (unsigned long)s->icnt, (uint32_t)s->pc,
-              (long)s->gpr[4], (long)s->gpr[5], (long)s->gpr[6],
-              (long)s->gpr[7], (long)s->gpr[8], (long)s->gpr[9]);
-      if(++probe_hits >= 64) break;
+    /* the first boundary at/after the requested one with npc == pc + 4 (the
+     * RTL resumes a checkpoint from a single pc) */
+    if(s->icnt >= ckpt_icnt or (have_ckpt_pc and s->pc == ckpt_pc)) {
+      ckpt_armed = true;
     }
-    /* A checkpoint must land on a clean architectural boundary: NOT in a
-     * branch delay slot (the pending branch target is not part of the saved
-     * state -- resuming would fall through and derail, agreeing between interp
-     * and RTL but diverging from the original run), and NOT with a load-linked
-     * armed (the RTL's llbit is not seeded, so a resumed SC would fail where
-     * the interp expects success).  Defer to the next safe retire. */
-    /* not in a delay slot, no LL armed, and not in exception mode: the restore shim
-     * ends with eret to the checkpoint PC, which cannot rebuild EXL/ERL + the
-     * handler's EPC (a sample inside the TLB-refill handler would lose it) */
-    /* WSSTART/WSSTOP: working-set profile window by instruction count (Linux runs
-     * have no VA-marker stores) */
-    { static const uint64_t g_wss = getenv("WSSTART") ? strtoull(getenv("WSSTART"), 0, 0) : 0;
-      static const uint64_t g_wse = getenv("WSSTOP") ? strtoull(getenv("WSSTOP"), 0, 0) : 0;
-      if(g_wsprof && g_wse) {
-        if(s->icnt == g_wss) {
-          g_wsprof->reset(s->icnt);
-          fprintf(stderr, "### WSRESET at icnt %llu\n", (unsigned long long)s->icnt);
-        }
-        else if(s->icnt == g_wse) {
-          g_wsprof->dump("window", s->icnt);
-        }
-      } }
-    bool ckpt_safe = !s->in_delay_slot && !s->ll_armed && !(s->cpr0[CPR0_SR] & (SR_EXL | SR_ERL));
-    if(ckpt_pc && (uint32_t)s->pc == ckpt_pc && ckpt_safe) {
-      fprintf(stderr, "[ckpt] reached pc=%08x at icnt=%lu -> dumping %s\n",
-              ckpt_pc, (unsigned long)s->icnt, ckpt_out.c_str());
-      dumpState(*s, ckpt_out);
+    if(ckpt_armed and s->npc == s->pc + 4 and not (s->sun4m and s->sun4m->cpu_halted)) {
+      save_checkpoint(ckpt_out.c_str(), s);
       break;
     }
-    if(ckpt_every && s->icnt >= ckpt_next && ckpt_safe) {
-      std::string f = ckpt_out + "." + std::to_string((unsigned long)s->icnt);
-      fprintf(stderr, "[ckpt] every: icnt=%lu (pc=%08x) -> %s\n",
-              (unsigned long)s->icnt, (uint32_t)s->pc, f.c_str());
-      dumpState(*s, f);
-      ckpt_next += ckpt_every;
+    timer_fired = false;
+    uint64_t ntraps0 = s->ntraps;
+    uint32_t insn = 0;
+    if(pcfp) {
+      debug_fetch(s, s->pc, &insn);
     }
-    if(ckpt_icnt && s->icnt >= ckpt_icnt && ckpt_safe) {
-      fprintf(stderr, "[ckpt] reached icnt=%lu (pc=%08x) -> dumping %s\n",
-              (unsigned long)s->icnt, (uint32_t)s->pc, ckpt_out.c_str());
-      dumpState(*s, ckpt_out);
-      break;
+    execSparc(s);
+    prev_exited = (s->ntraps != ntraps0) or qemu_tb_exits(insn) or (s->sun4m and s->sun4m->cpu_halted);
+    if(s->sun4m and s->sun4m->reset_req) {
+      system_reset(s);
     }
-    if(valt || dft) { for(int gi=0; gi<32; gi++) gprsnap[gi]=(uint64_t)s->gpr[gi]; }
-    maybe_take_interrupt(s);   /* CP0 Count/Compare timer + Int delivery (per step) */
-    if(s->gdb) s->gdb->step_hook(s);   /* gdb RSP: breakpoints / attach / step */
-    uint64_t valt_pc = (uint64_t)s->pc;
-    g_cur_pc = (uint64_t)s->pc; g_cur_icnt = s->icnt;   /* context for memory watchpoints */
-    uint32_t df_inst = 0;
-    const bool df_be = dft && (s->icnt >= dflo) && (s->icnt < dfhi) &&
-                       (valt_pc >= 0x0c000000ULL) && (valt_pc < 0x10000000ULL);
-    if(df_be) { guest_rd32_be(s, valt_pc, &df_inst); }   /* fetch inst before it executes */
-    if(g_watch_ldpc && (uint32_t)s->pc == g_watch_ldpc &&
-       s->icnt >= g_watch_lo && s->icnt < g_watch_hi)
-      fprintf(stderr, "[ldbase] icnt=%lu pc=%08x r15=%016llx va=%016llx\n",
-              (unsigned long)s->icnt, (uint32_t)s->pc,
-              (unsigned long long)s->gpr[15], (unsigned long long)(s->gpr[15] + 60));
-    { /* FIRSTUSER: log each time execution enters a NEW user-mode (KSU=2) program
-       * page -- to locate the first o32 user program for a pre-crash checkpoint. */
-      static const bool g_fu = getenv("FIRSTUSER") != nullptr;
-      if(g_fu) {
-        uint32_t sr = s->cpr0[CPR0_SR];
-        bool user = ((sr & 0x18u) == 0x10u) && !(sr & 0x6u);   /* KSU=2, !EXL, !ERL */
-        if(user && (uint32_t)s->pc < 0x80000000u) {
-          static uint32_t last_page = 0xffffffffu;
-          uint32_t page = (uint32_t)s->pc & 0xfff00000u;
-          if(page != last_page) {
-            fprintf(stderr, "[FIRSTUSER] icnt=%lu pc=%08x sr=%08x\n",
-                    (unsigned long)s->icnt, (uint32_t)s->pc, sr);
-            last_page = page;
-          }
-        }
-      }
-    }
-    const uint64_t bbv_pc = (uint64_t)s->pc;
-    uint32_t brt_insn = 0;
-    if(brt && !guest_rd32_be(s, bbv_pc, &brt_insn)) {
-      brt_insn = 0;
-    }
-    execMips(s);
-    if(bbv) { bbv->step(bbv_pc, (uint64_t)s->pc, s->icnt); }
-    if(brt) { brt->step(bbv_pc, brt_insn, (uint64_t)s->pc); }
-    if(g_htrace) {   /* kernel TLB-Mod handler trace: executed pc + kernel scratch + arg regs */
-      fprintf(stderr, "[HTRACE] pc=%08x k0=%016llx k1=%016llx a0=%016llx a1=%016llx a2=%016llx a3=%016llx cause=%02x epc=%08x sr=%08x\n",
-              (uint32_t)valt_pc,
-              (unsigned long long)s->gpr[26], (unsigned long long)s->gpr[27],
-              (unsigned long long)s->gpr[4], (unsigned long long)s->gpr[5],
-              (unsigned long long)s->gpr[6], (unsigned long long)s->gpr[7],
-              (s->cpr0[CPR0_CAUSE]>>2)&0x1f, s->cpr0[CPR0_EPC], s->cpr0[CPR0_SR]);
-      g_htrace--;
-    }
-    if(valt && (valt_all || (valt_pc>=0x120000000ULL && valt_pc<0x120640000ULL))) {
-      int vd=-1; for(int gi=1; gi<32; gi++) if((uint64_t)s->gpr[gi]!=gprsnap[gi]) { vd=gi; break; }
-      fprintf(valt, "%llx %d %llx\n", (unsigned long long)valt_pc, vd,
-              (unsigned long long)(vd<0?0:(uint64_t)s->gpr[vd]));
-    }
-    if(df_be) {   /* build_dataflow.py 22-byte record: <Q pc><I inst><B valid><B dst><Q val> */
-      int dd=-1; for(int gi=1; gi<32; gi++) if((uint64_t)s->gpr[gi]!=gprsnap[gi]) { dd=gi; break; }
-      uint8_t dvalid = (dd>=0)?1:0, ddst = (dd>=0)?(uint8_t)dd:0;
-      uint64_t dval = (dd>=0)?(uint64_t)s->gpr[dd]:0;
-      fwrite(&valt_pc,8,1,dft); fwrite(&df_inst,4,1,dft);
-      fwrite(&dvalid,1,1,dft);  fwrite(&ddst,1,1,dft); fwrite(&dval,8,1,dft);
-    }
-#ifdef ENABLE_COSIM
-    uint64_t mh = COSIM_NO_HASH;
-    if(cosim_active() && s->icnt >= cosim_memstart && (s->icnt % cosim_memn) == 0) {
-      const uint64_t *w = reinterpret_cast<const uint64_t*>(s->mem.mem + 0x08000000u);
-      uint64_t h = 1469598103934665603ULL;       /* FNV-1a over low DRAM [0x08000000,0x18000000) (must match DUT) */
-      for(size_t i = 0; i < (0x10000000u/8); i++) h = (h ^ w[i]) * 1099511628211ULL;
-      mh = h;
-    }
-    uint32_t cp0dbg[4] = { s->cpr0[CPR0_CAUSE], s->cpr0[CPR0_SR],
-                           s->cpr0[CPR0_COUNT], s->cpr0[CPR0_EPC] };
-    if(cosim_step(s->icnt, (int64_t)s->pc, (const int64_t*)s->gpr, mh, cp0dbg)) break;   /* lockstep co-sim */
-#endif
-  }
-#ifdef ENABLE_COSIM
-  if(cosim_active()) {   /* COSIM_RAMDUMP=<file>: dump low DRAM at the stop point to diff */
-    const char *rd = getenv("COSIM_RAMDUMP");
-    if(rd) { FILE *f = fopen(rd, "wb"); if(f) { fwrite(s->mem.mem + 0x08000000u, 1, 0x10000000u, f); fclose(f);
-      fprintf(stderr, "[cosim] dumped low DRAM to %s at icnt=%lu\n", rd, (unsigned long)s->icnt); } }
-  }
-#endif
-  t0 = timestamp() - t0;
-
-  if(s->scsi) s->scsi->flush_delta();   /* persist COW overlay on clean exit (no-op without --disk-delta) */
-
-  if(globals::pctrace) fclose(globals::pctrace);
-  if(brt) {
-    std::cerr << "wrote " << brt->n << " branch records to " << brtrace_out << "\n";
-    delete brt;
-  }
-  if(bbv) {
-    bbv->dump(bbv_out);
-    std::cerr << "wrote basic-block vectors to " << bbv_out << "\n";
-    delete bbv;
-  }
-  std::cout << "\n" << s->icnt << " instructions executed, brk=" << (int)s->brk << "\n";
-  if(getenv("PREDECODE_STATS")) {
-    report_decode_cache();
-  }
-  std::cout << (static_cast<double>(s->icnt) / t0)*1e-6 << " minsns/sec\n";
-
-  
-  if(!retire_name.empty() && !rt.empty()) {
-    std::ofstream ofs(retire_name, std::ios::binary);
-    boost::archive::binary_oarchive oa(ofs);
-    oa << rt;
-    std::cout << "wrote " << rt.get_records().size()
-              << " retire_trace records to " << retire_name << "\n";
   }
 
-  delete np_disp;
-  delete s->np;
-  delete s->ps2;
-  delete s->mc; delete s->hpc; delete s->scc; delete s->scsi; delete s->seeq; delete s; delete sm;
-  return 0;
+  if(dump) {
+    std::cerr << *s;
+  }
+  std::cerr << "ISS: " << s->icnt << " insns, exit code " << s->exit_code
+	    << (s->error_mode ? " (error mode)" : "") << "\n";
+  if(trace_from != ~0ULL) {
+    stopCapstone();
+  }
+  if(pcfp) {
+    fclose(pcfp);
+  }
+  int rc = s->exit_code;
+  delete s;
+  return rc;
 }

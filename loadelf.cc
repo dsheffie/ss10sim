@@ -11,6 +11,7 @@
 #include <utility>
 #include <cstdint>
 #include <list>
+#include <functional>
 
 
 #include "helper.hh"
@@ -105,11 +106,11 @@ void load_elf(const char* fn, state_t *ms) {
     exit(-1);
   }
 
-  /* Check for a MIPS machine */
+  /* Check for a SPARC machine (EM_SPARC=2, EM_SPARC32PLUS=18) */
   assert(checkBigEndian(eh32));
 
-  if(bswap_(eh32->e_machine) != 8) {
-    printf("INTERP : non-mips binary..goodbye\n");
+  if(bswap_(eh32->e_machine) != 2 && bswap_(eh32->e_machine) != 18) {
+    printf("INTERP : non-sparc binary..goodbye\n");
     exit(-1);
   }
 
@@ -120,7 +121,8 @@ void load_elf(const char* fn, state_t *ms) {
   ph32 = reinterpret_cast<Elf32_Phdr*>(buf + e_phoff);
   e_shnum = bswap_(eh32->e_shnum);
   sh32 = reinterpret_cast<Elf32_Shdr*>(buf + bswap_(eh32->e_shoff));
-  ms->pc = (int64_t)(int32_t)lAddr;
+  ms->pc = lAddr;
+  ms->npc = lAddr + 4;
 
   uint32_t loaddr = ~0U, hiaddr = 0;
   /* Find instruction segments and copy to
@@ -156,18 +158,13 @@ void load_elf(const char* fn, state_t *ms) {
       
       
       /* not strictly required, prefault fills with zeros */
-#ifndef __EMSCRIPTEN__
-      /* zeroes at the RAW kseg0 vaddr (~0x88xxxxxx). Harmless on the 4 GiB map,
-       * but out of bounds on the web build's 512 MiB calloc -- and redundant
-       * there anyway, since calloc already zeroed the whole (physical) map. */
       for(int32_t cc = 0; cc < p_memsz; cc++) {
 	mem.set<uint8_t>(cc+p_vaddr, 0);
       }
-#endif
       
       for(int32_t cc = 0; cc < p_filesz; cc++) {
 	uint32_t v_addr = cc+p_vaddr;
-	mem.set<uint8_t>(va2pa(v_addr),
+	mem.set<uint8_t>(v_addr,
 			 reinterpret_cast<uint8_t*>(buf + p_offset)[cc]);
       }
     }
@@ -178,3 +175,40 @@ void load_elf(const char* fn, state_t *ms) {
   //exit(-1);
 }
 
+
+bool for_each_elf_segment(const char *fn,
+			  const std::function<void(uint32_t, const uint8_t *, uint32_t, uint32_t)> &f,
+			  uint32_t *entry, uint64_t *total) {
+  int fd = open(fn, O_RDONLY);
+  if(fd < 0) {
+    return false;
+  }
+  struct stat st;
+  if(fstat(fd, &st) < 0 or static_cast<size_t>(st.st_size) < sizeof(Elf32_Ehdr)) {
+    close(fd);
+    return false;
+  }
+  const uint8_t *buf = static_cast<const uint8_t *>(mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0));
+  close(fd);
+  if(buf == MAP_FAILED) {
+    return false;
+  }
+  const Elf32_Ehdr *eh = reinterpret_cast<const Elf32_Ehdr *>(buf);
+  bool ok = checkElf(eh) and check32Bit(eh) and checkBigEndian(eh) and
+    (bswap_(eh->e_machine) == 2 or bswap_(eh->e_machine) == 18);
+  if(ok) {
+    *entry = bswap_(eh->e_entry);
+    *total = 0;
+    const Elf32_Phdr *ph = reinterpret_cast<const Elf32_Phdr *>(buf + bswap_(eh->e_phoff));
+    for(uint32_t i = 0; i < bswap_(eh->e_phnum); i++, ph++) {
+      if(bswap_(ph->p_type) != PT_LOAD) {
+	continue;
+      }
+      uint32_t memsz = bswap_(ph->p_memsz);
+      f(bswap_(ph->p_vaddr), buf + bswap_(ph->p_offset), bswap_(ph->p_filesz), memsz);
+      *total += memsz;
+    }
+  }
+  munmap(const_cast<uint8_t *>(buf), st.st_size);
+  return ok;
+}

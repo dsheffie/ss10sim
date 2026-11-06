@@ -4,6 +4,7 @@
 *~
 githash.cc
 interp_mips
+ss10sim
 
 # retire-trace output + rv64analyzer-generated artifacts
 *.rt
@@ -40,7 +41,7 @@ gin.txt
 emcc_obj/
 sf_wasm_obj/
 boost_shim/
-guest/
+guest/build/
 interp_mips.js
 build_id.js
 interp_mips.wasm
