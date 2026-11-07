@@ -190,8 +190,8 @@ int main(int argc, char *argv[]) {
   std::string ckpt_pc_s, ckpt_out = "ss10sim.ckpt", restore;
   std::string kernel, append;
   std::vector<std::string> scsi_disks, scsi_cdroms;
-  std::string console_input;
-  uint64_t console_input_at = 0;
+  std::vector<std::string> console_inputs;
+  std::vector<uint64_t> console_input_ats;
   uint64_t max_icnt = ~0ULL;
   std::string tcx_rom, fb_png, kbd_input;
   uint64_t kbd_input_at = 0;
@@ -224,10 +224,12 @@ int main(int argc, char *argv[]) {
       ("cdrom-bs", po::value<uint32_t>(&cdrom_bs), "CD-ROM block size at power-on: 2048, or 512 as Sun's drives (Solaris 2.5.1)")
       ("scsi-cdrom", po::value<std::vector<std::string>>(&scsi_cdroms)->composing(),
        "[ID:]image: a SCSI CD-ROM on the ESP (default ID 6, as an SS-20's)")
-      ("console-input", po::value<std::string>(&console_input),
-       "file (or - for stdin) typed into ttya, one byte whenever its receiver is empty; \\n is sent as \\r")
-      ("console-input-at", po::value<uint64_t>(&console_input_at),
-       "with --console-input: start typing at this icount (so start-up code cannot swallow it)")
+      ("console-input", po::value<std::vector<std::string>>(&console_inputs)->composing(),
+       "file (or - for stdin) typed into ttya, one byte whenever its receiver is empty; \\n is sent as \\r.  "
+       "Repeatable: each file starts once the previous one is used up")
+      ("console-input-at", po::value<std::vector<uint64_t>>(&console_input_ats)->composing(),
+       "with --console-input: start typing at this icount (so start-up code cannot swallow it); "
+       "the Nth one goes with the Nth --console-input")
       ("tcx", po::value<std::string>(&tcx_rom)->implicit_value("/usr/share/qemu/QEMU,tcx.bin"),
        "a TCX framebuffer (1024x768x8) in SBus slot 2, with this FCode PROM (default qemu's QEMU,tcx.bin)")
       ("console-icount", po::bool_switch(&console_icount),
@@ -331,14 +333,24 @@ int main(int argc, char *argv[]) {
   if(not restore.empty() and not load_checkpoint(restore.c_str(), s)) {
     return 1;
   }
-  int con_fd = -1;
-  if(not console_input.empty()) {
-    con_fd = (console_input == "-") ? 0 : open(console_input.c_str(), O_RDONLY);
-    if(con_fd < 0) {
-      fprintf(stderr, "ss10sim: cannot open --console-input %s\n", console_input.c_str());
+  /* --console-input files, typed in turn: the next opens when one is used up */
+  if(console_input_ats.size() > console_inputs.size()) {
+    fprintf(stderr, "ss10sim: more --console-input-at than --console-input\n");
+    return 1;
+  }
+  console_input_ats.resize(console_inputs.size(), 0);
+  std::vector<int> con_fds;
+  for(const std::string &f : console_inputs) {
+    const int fd = (f == "-") ? 0 : open(f.c_str(), O_RDONLY);
+    if(fd < 0) {
+      fprintf(stderr, "ss10sim: cannot open --console-input %s\n", f.c_str());
       return 1;
     }
+    con_fds.push_back(fd);
   }
+  size_t con_idx = 0;
+  int con_fd = con_fds.empty() ? -1 : con_fds[0];
+  uint64_t console_input_at = con_fds.empty() ? 0 : console_input_ats[0];
   /* --kbd-input: the file as Sun key events (keycode | 0x80 = release) */
   std::vector<uint8_t> kbd_keys;
   if(not kbd_input.empty()) {
@@ -427,6 +439,10 @@ int main(int argc, char *argv[]) {
 	    close(con_fd);
 	  }
 	  con_fd = -1;
+	  if(++con_idx < con_fds.size()) {
+	    con_fd = con_fds[con_idx];
+	    console_input_at = console_input_ats[con_idx];
+	  }
 	}
       }
     }
