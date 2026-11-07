@@ -1,6 +1,6 @@
 UNAME_S = $(shell uname -s)
 
-OBJ = main.o interpret.o sun4m.o esp.o scsi.o disassemble.o loadelf.o helper.o sparse_mem.o ckpt.o
+OBJ = main.o interpret.o sun4m.o esp.o lance.o scsi.o tcx.o cg14.o display.o disassemble.o loadelf.o helper.o sparse_mem.o ckpt.o
 
 ifeq ($(UNAME_S),Linux)
 	CXX = clang++-20 -march=native -flto
@@ -18,7 +18,15 @@ ifeq ($(UNAME_S),Darwin)
 endif
 
 CXXFLAGS = -std=c++17 -g $(OPT)
-LIBS =  $(EXTRA_LD) -lpthread
+LIBS =  $(EXTRA_LD) -lpng -lpthread
+
+# SDL2 (optional): the live TCX window (--sdl).  Without it --fb-png is the
+# way to see the screen.
+SDL_LIBS := $(shell sdl2-config --libs 2>/dev/null)
+ifneq ($(SDL_LIBS),)
+	CXXFLAGS += -DHAVE_SDL $(shell sdl2-config --cflags)
+	LIBS += $(SDL_LIBS)
+endif
 
 DEP = $(OBJ:.o=.d)
 OPT = -O3 -g -fomit-frame-pointer

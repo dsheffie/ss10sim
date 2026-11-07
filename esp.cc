@@ -85,12 +85,10 @@ void sun4m_t::esp_dma_enable(bool level) {
   }
 }
 
-/* qemu espdma_memory_read/write: len bytes at the espdma address through the
- * IOMMU (sun4m_iommu.c: the page table at BASE << 4, one entry per 4K of the
- * range CTRL selects), then the address advances */
-void sun4m_t::esp_dma_mem(uint8_t *buf, uint32_t len, bool to_mem) {
+/* len bytes at DVMA address dvma through the IOMMU (qemu sun4m_iommu.c: the
+ * page table at BASE << 4, one entry per 4K of the range CTRL selects) */
+void sun4m_t::iommu_dma(const char *who, uint32_t dvma, uint8_t *buf, uint32_t len, bool to_mem) {
   const uint32_t range = 0x01000000u << ((iommu[0] >> 2) & 7);   /* IOMMU_CTRL.RNGE */
-  uint32_t dvma = espdma.r[1];
   uint32_t done = 0;
   while(done < len) {
     const uint32_t off = dvma & 0xfff;
@@ -105,7 +103,7 @@ void sun4m_t::esp_dma_mem(uint8_t *buf, uint32_t len, bool to_mem) {
     const bool ok = (pte & 0x2) and (not to_mem or (pte & 0x4)) and io_s != nullptr and
 		    pa + n <= io_s->ram_size;
     if(not ok) {
-      fprintf(stderr, "sun4m: espdma: bad DVMA 0x%08x (pte 0x%08x) for a %s\n", dvma, pte,
+      fprintf(stderr, "sun4m: %s: bad DVMA 0x%08x (pte 0x%08x) for a %s\n", who, dvma, pte,
 	      to_mem ? "write" : "read");
       if(not to_mem) {
 	memset(buf + done, 0, n);
@@ -113,6 +111,12 @@ void sun4m_t::esp_dma_mem(uint8_t *buf, uint32_t len, bool to_mem) {
     }
     else if(to_mem) {
       memcpy(io_s->mem.mem + pa, buf + done, n);
+      if(dma_hook != nullptr) {
+	dma_hook(dma_hook_ctx, pa, buf + done, n);
+      }
+      else if(dma_mirror != nullptr) {
+	memcpy(dma_mirror->mem.mem + pa, buf + done, n);
+      }
     }
     else {
       memcpy(buf + done, io_s->mem.mem + pa, n);
@@ -120,6 +124,12 @@ void sun4m_t::esp_dma_mem(uint8_t *buf, uint32_t len, bool to_mem) {
     dvma += n;
     done += n;
   }
+}
+
+/* qemu espdma_memory_read/write: len bytes at the espdma address, which then
+ * advances */
+void sun4m_t::esp_dma_mem(uint8_t *buf, uint32_t len, bool to_mem) {
+  iommu_dma("espdma", espdma.r[1], buf, len, to_mem);
   espdma.r[1] += len;
 }
 

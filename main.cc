@@ -15,6 +15,8 @@
 #include "helper.hh"
 #include "ckpt.hh"
 #include "globals.hh"
+#include "display.hh"
+#include "keymap.hh"
 
 /* Standalone SPARC V8 ISS driver: run an ELF, optionally under Linux user-mode
  * syscall/window emulation (--user) so the same static binary can be diffed
@@ -31,7 +33,7 @@ namespace globals {
 /* --scsi-disk / --scsi-cdrom: "[ID:]image" targets on the ESP's bus; without an
  * ID the next free one from first_id up (the initiator, the ESP, is ID 7) */
 static bool attach_scsi(sun4m_t *m, const std::vector<std::string> &specs, scsi_dev_t::type_t t,
-			uint32_t first_id) {
+			uint32_t first_id, uint32_t cdrom_bs = 2048) {
   uint32_t next = first_id;
   for(const std::string &spec : specs) {
     uint32_t id;
@@ -55,6 +57,10 @@ static bool attach_scsi(sun4m_t *m, const std::vector<std::string> &specs, scsi_
     if(not d->ok()) {
       delete d;
       return false;
+    }
+    if(t == scsi_dev_t::type_t::cdrom) {
+      d->power_on_bs = cdrom_bs;
+      d->bs = cdrom_bs;
     }
     m->scsi[id] = d;
     fprintf(stderr, "scsi: target %u: %s\n", id, path.c_str());
@@ -180,13 +186,20 @@ int main(int argc, char *argv[]) {
   uint32_t icount_shift = 4;
   uint64_t trace_from = ~0ULL;
   int64_t rtc_base = 1767225600;
-  uint64_t ckpt_icnt = ~0ULL;
+  uint64_t ckpt_icnt = ~0ULL, ckpt_exec = ~0ULL;
   std::string ckpt_pc_s, ckpt_out = "ss10sim.ckpt", restore;
   std::string kernel, append;
   std::vector<std::string> scsi_disks, scsi_cdroms;
   std::string console_input;
   uint64_t console_input_at = 0;
   uint64_t max_icnt = ~0ULL;
+  std::string tcx_rom, fb_png, kbd_input;
+  uint64_t kbd_input_at = 0;
+  bool no_kbd = false;
+  uint32_t cdrom_bs = 2048;
+  uint64_t fb_png_every = 0;
+  bool sdl = false, cg14 = false, console_icount = false;
+  uint32_t cg14_depth = 0;
   bool user = false, trace = false, dump = false, with_sun4m = false;
   try {
     po::options_description desc("Options");
@@ -208,13 +221,32 @@ int main(int argc, char *argv[]) {
       ("append", po::value<std::string>(&append), "with --kernel: the kernel command line (qemu -append)")
       ("scsi-disk", po::value<std::vector<std::string>>(&scsi_disks)->composing(),
        "[ID:]image: a SCSI disk on the ESP (default ID 0, then 1, ...; written in place)")
+      ("cdrom-bs", po::value<uint32_t>(&cdrom_bs), "CD-ROM block size at power-on: 2048, or 512 as Sun's drives (Solaris 2.5.1)")
       ("scsi-cdrom", po::value<std::vector<std::string>>(&scsi_cdroms)->composing(),
        "[ID:]image: a SCSI CD-ROM on the ESP (default ID 6, as an SS-20's)")
       ("console-input", po::value<std::string>(&console_input),
        "file (or - for stdin) typed into ttya, one byte whenever its receiver is empty; \\n is sent as \\r")
       ("console-input-at", po::value<uint64_t>(&console_input_at),
        "with --console-input: start typing at this icount (so start-up code cannot swallow it)")
+      ("tcx", po::value<std::string>(&tcx_rom)->implicit_value("/usr/share/qemu/QEMU,tcx.bin"),
+       "a TCX framebuffer (1024x768x8) in SBus slot 2, with this FCode PROM (default qemu's QEMU,tcx.bin)")
+      ("console-icount", po::bool_switch(&console_icount),
+       "also write each ttya line to stderr with the icount it ended at")
+      ("cg14", po::bool_switch(&cg14), "a CG14 (SX) framebuffer on an 8 MB VSIMM in slot 3 (what NeXTSTEP drives on an SS-20)")
+      ("cg14-depth", po::value<uint32_t>(&cg14_depth),
+       "with --cg14: show the VRAM as 8 or 32 (XBGR) bits per pixel whatever the MCR pixel mode says "
+       "(NeXTSTEP's WindowServer draws 32 with MCR in 8-bit mode)")
+      ("sdl", po::bool_switch(&sdl), "with --tcx: show the screen in an SDL window (closing it stops the run)")
+      ("kbd-input", po::value<std::string>(&kbd_input),
+       "with --tcx/--cg14: a file typed on the Sun keyboard (ASCII, US layout; \\n is Return, ^A-^Z are Control+letter)")
+      ("no-kbd", po::bool_switch(&no_kbd), "with --tcx or --cg14: no keyboard (OBP falls back to ttya, like qemu -nographic)")
+      ("kbd-input-at", po::value<uint64_t>(&kbd_input_at), "with --kbd-input: start typing at this icount")
+      ("fb-png", po::value<std::string>(&fb_png), "with --tcx: write the screen to this PNG at exit")
+      ("fb-png-every", po::value<uint64_t>(&fb_png_every), "with --fb-png: also every this many instructions (a %llu in the --fb-png name numbers them by icount)")
       ("checkpoint-at", po::value<uint64_t>(&ckpt_icnt), "write a checkpoint (--checkpoint-out) when icnt reaches this, then exit")
+      ("checkpoint-after-exec", po::value<uint64_t>(&ckpt_exec),
+       "write a checkpoint once this many instructions have executed since start/restore (halted time, "
+       "which advances icnt, does not count: the point lands in real work), then exit")
       ("checkpoint-at-pc", po::value<std::string>(&ckpt_pc_s), "write a checkpoint the first time this pc is about to execute, then exit")
       ("checkpoint-out", po::value<std::string>(&ckpt_out), "checkpoint file to write (default ss10sim.ckpt)")
       ("restore", po::value<std::string>(&restore), "start from a checkpoint (after the --rom/--kernel setup it replaces)")
@@ -248,8 +280,35 @@ int main(int argc, char *argv[]) {
     if(not nvram.empty() and not s->sun4m->load_nvram(nvram.c_str())) {
       return 1;
     }
+    if(not tcx_rom.empty()) {
+      s->sun4m->tcx = new tcx_t();
+      if(not s->sun4m->tcx->load_rom(tcx_rom)) {
+	fprintf(stderr, "ss10sim: cannot read the TCX FCode %s\n", tcx_rom.c_str());
+	return 1;
+      }
+    }
+    if(cg14) {
+      if(cg14_depth != 0 and cg14_depth != 8 and cg14_depth != 32) {
+	fprintf(stderr, "ss10sim: --cg14-depth must be 8 or 32\n");
+	return 1;
+      }
+      s->sun4m->cg14 = new cg14_t();
+      s->sun4m->cg14->depth_override = cg14_depth;
+    }
+    if(s->sun4m->tcx or s->sun4m->cg14) {
+      /* a console with a screen has a keyboard (qemu without -nographic);
+       * --no-kbd is qemu -nographic: OBP still probes and maps the framebuffer
+       * but falls back to ttya (Solaris 2.5.1 needs that framebuffer mapping:
+       * it leaves the hole its phys_avail check looks for) */
+      s->sun4m->have_kbd = not no_kbd;
+      s->sun4m->reset_devices(0);  /* power-on state again, with the framebuffer and the keyboard */
+    }
+    if(cdrom_bs != 512 and cdrom_bs != 2048) {
+      fprintf(stderr, "ss10sim: --cdrom-bs must be 512 or 2048\n");
+      return 1;
+    }
     if(not attach_scsi(s->sun4m, scsi_disks, scsi_dev_t::type_t::disk, 0) or
-       not attach_scsi(s->sun4m, scsi_cdroms, scsi_dev_t::type_t::cdrom, 6)) {
+       not attach_scsi(s->sun4m, scsi_cdroms, scsi_dev_t::type_t::cdrom, 6, cdrom_bs)) {
       return 1;
     }
     s->ram_size = static_cast<uint64_t>(ram_mb) << 20;
@@ -280,6 +339,52 @@ int main(int argc, char *argv[]) {
       return 1;
     }
   }
+  /* --kbd-input: the file as Sun key events (keycode | 0x80 = release) */
+  std::vector<uint8_t> kbd_keys;
+  if(not kbd_input.empty()) {
+    FILE *kf = fopen(kbd_input.c_str(), "rb");
+    if(kf == nullptr or s->sun4m == nullptr or not s->sun4m->have_kbd) {
+      fprintf(stderr, "ss10sim: --kbd-input needs --tcx or --cg14 and a readable %s\n", kbd_input.c_str());
+      return 1;
+    }
+    const uint8_t sun_shift = usb_to_sun(0xe1), sun_ctrl = usb_to_sun(0xe0);
+    for(int c = fgetc(kf); c != EOF; c = fgetc(kf)) {
+      bool shift = false;
+      /* control characters (other than tab and newline): Control + the letter */
+      if(c >= 1 and c <= 26 and c != '\t' and c != '\n') {
+	const uint8_t k = usb_to_sun(0x04 + (c - 1));
+	kbd_keys.push_back(sun_ctrl);
+	kbd_keys.push_back(k);
+	kbd_keys.push_back(k | 0x80);
+	kbd_keys.push_back(sun_ctrl | 0x80);
+	continue;
+      }
+      const uint8_t k = usb_to_sun(ascii_to_usb(static_cast<char>(c), &shift));
+      if(k == 0) {
+	continue;
+      }
+      if(shift) {
+	kbd_keys.push_back(sun_shift);
+      }
+      kbd_keys.push_back(k);
+      kbd_keys.push_back(k | 0x80);
+      if(shift) {
+	kbd_keys.push_back(sun_shift | 0x80);
+      }
+    }
+    fclose(kf);
+  }
+  size_t kbd_pos = 0;
+  uint64_t kbd_next = kbd_input_at;
+  if(console_icount and s->sun4m) {
+    s->sun4m->serial.line_icnt = &s->icnt;
+  }
+  fb_display *disp = nullptr;
+  if(s->sun4m and (s->sun4m->tcx or s->sun4m->cg14) and (sdl or not fb_png.empty())) {
+    framebuffer_t *fb = s->sun4m->cg14 ? static_cast<framebuffer_t *>(s->sun4m->cg14) : s->sun4m->tcx;
+    disp = new fb_display(fb, sdl, fb_png, fb_png_every);
+  }
+  uint64_t next_pump = 0;
   const bool have_ckpt_pc = not ckpt_pc_s.empty();
   const uint32_t ckpt_pc = have_ckpt_pc ? static_cast<uint32_t>(std::stoul(ckpt_pc_s, nullptr, 0)) : 0;
   FILE *pcfp = pctrace.empty() ? nullptr : fopen(pctrace.c_str(), "w");
@@ -294,7 +399,18 @@ int main(int argc, char *argv[]) {
   bool timer_fired = false;
   bool prev_exited = true;
   bool ckpt_armed = false;
+  uint64_t n_exec = 0;       /* instructions executed here (icnt also counts halted time) */
   while(not s->brk and s->icnt < max_icnt) {
+    if(kbd_pos < kbd_keys.size() and s->icnt >= kbd_next and s->sun4m->kbd_ms.kbd_idle()) {
+      const uint8_t k = kbd_keys[kbd_pos++];
+      s->sun4m->kbd_ms.kbd_event(k & 0x7f, not (k & 0x80));
+      s->sun4m->update_irqs(s);
+      kbd_next = s->icnt + 200000;
+    }
+    if(disp and s->icnt >= next_pump) {
+      disp->pump(s);
+      next_pump = s->icnt + 65536;
+    }
     /* typed console input: a byte when ttya's receiver is empty (checked every
      * 4K instructions; poll() so an interactive stdin never blocks the run) */
     if(con_fd >= 0 and s->sun4m and (s->icnt & 4095) == 0 and s->icnt >= console_input_at and
@@ -360,7 +476,7 @@ int main(int argc, char *argv[]) {
     }
     /* the first boundary at/after the requested one with npc == pc + 4 (the
      * RTL resumes a checkpoint from a single pc) */
-    if(s->icnt >= ckpt_icnt or (have_ckpt_pc and s->pc == ckpt_pc)) {
+    if(s->icnt >= ckpt_icnt or n_exec >= ckpt_exec or (have_ckpt_pc and s->pc == ckpt_pc)) {
       ckpt_armed = true;
     }
     if(ckpt_armed and s->npc == s->pc + 4 and not (s->sun4m and s->sun4m->cpu_halted)) {
@@ -374,15 +490,18 @@ int main(int argc, char *argv[]) {
       debug_fetch(s, s->pc, &insn);
     }
     execSparc(s);
+    n_exec++;
     prev_exited = (s->ntraps != ntraps0) or qemu_tb_exits(insn) or (s->sun4m and s->sun4m->cpu_halted);
     if(s->sun4m and s->sun4m->reset_req) {
       system_reset(s);
     }
   }
 
+  delete disp;               /* (the final --fb-png) */
   if(dump) {
     std::cerr << *s;
   }
+  std::cerr << "ISS: executed " << n_exec << " instructions\n";
   std::cerr << "ISS: " << s->icnt << " insns, exit code " << s->exit_code
 	    << (s->error_mode ? " (error mode)" : "") << "\n";
   if(trace_from != ~0ULL) {

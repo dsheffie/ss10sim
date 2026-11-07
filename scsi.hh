@@ -24,6 +24,9 @@ struct scsi_req_t {
   /* a pending WRITE (committed by finish_out) */
   bool is_write = false;
   uint64_t wr_lba = 0;
+  /* a pending MODE SELECT (6 or 10): finish_out parses its block descriptor */
+  bool is_mode_select = false;
+  bool ms10 = false;
 };
 
 class scsi_dev_t {
@@ -36,15 +39,23 @@ public:
   /* the target's state that a checkpoint carries */
   uint8_t sense[18] = {0};
   bool unit_attention = true;  /* power-on reset, reported once (qemu: SENSE_CODE(POWER_ON)) */
+  uint32_t bs = 512;           /* the block size: a CD-ROM's MODE SELECT switches 2048 <-> 512 */
+  /* a CD-ROM's block size at power-on and after a reset: 2048, or 512 (ss10sim
+   * --cdrom-bs) as Sun-firmware drives, which Solaris 2.5.1 assumes */
+  uint32_t power_on_bs = 2048;
   /* a SCSI bus reset or a device reset */
-  void reset() { unit_attention = true; }
+  void reset() {
+    unit_attention = true;
+    if(t == type_t::cdrom) {
+      bs = power_on_bs;
+    }
+  }
   int32_t send(uint32_t lun, const uint8_t *cdb, uint32_t len, scsi_req_t &r);
   void finish_out(scsi_req_t &r);
 private:
   type_t t;
   int fd = -1;
   uint64_t bytes = 0;
-  uint32_t bs = 512;
   bool writable = false;
   uint64_t nblocks() const { return bytes / bs; }
   void set_sense(uint8_t key, uint8_t asc, uint8_t ascq);

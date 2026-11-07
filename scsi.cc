@@ -293,13 +293,15 @@ int32_t scsi_dev_t::send(uint32_t lun, const uint8_t *cdb, uint32_t len, scsi_re
       r.buf.assign(static_cast<size_t>(n) * bs, 0);
       return -static_cast<int32_t>(r.buf.size());
     }
-    case 0x15:                 /* MODE SELECT(6): accepted, ignored */
+    case 0x15:                 /* MODE SELECT(6) */
     case 0x55: {               /* MODE SELECT(10) */
       const uint32_t n = (op == 0x15) ? cdb[4] : ((cdb[7] << 8) | cdb[8]);
       r.status = 0;
       if(n == 0) {
 	return 0;
       }
+      r.is_mode_select = true;
+      r.ms10 = (op == 0x55);
       r.buf.assign(n, 0);
       return -static_cast<int32_t>(n);
     }
@@ -414,5 +416,24 @@ int32_t scsi_dev_t::send(uint32_t lun, const uint8_t *cdb, uint32_t len, scsi_re
 void scsi_dev_t::finish_out(scsi_req_t &r) {
   if(r.is_write and not write_blocks(r.wr_lba, static_cast<uint32_t>(r.buf.size() / bs), r.buf.data())) {
     check(r, SK_MEDIUM_ERROR, ASC_WRITE_ERROR, 0);
+  }
+  /* MODE SELECT: only a CD-ROM's block descriptor is honored -- its block length
+   * picks 512- or 2048-byte blocks.  Sun's CD-ROM drives run in 512-byte mode
+   * and Solaris 2.5.1's sd selects it (a 2048-byte answer to its 1-block READ
+   * is a DMA overrun and "cannot mount root"); other pages are ignored. */
+  if(r.is_mode_select and t == type_t::cdrom) {
+    const size_t hdr = r.ms10 ? 8 : 4;
+    const uint32_t bdl = r.ms10 ? ((r.buf.size() > 7) ? ((r.buf[6] << 8) | r.buf[7]) : 0)
+                                : ((r.buf.size() > 3) ? r.buf[3] : 0);
+    if(bdl >= 8 and r.buf.size() >= hdr + 8) {
+      const uint8_t *d = &r.buf[hdr];
+      const uint32_t len = (d[5] << 16) | (d[6] << 8) | d[7];
+      if(len == 512 or len == 2048) {
+	if(len != bs) {
+	  fprintf(stderr, "scsi: cdrom block size %u -> %u (MODE SELECT)\n", bs, len);
+	}
+	bs = len;
+      }
+    }
   }
 }
