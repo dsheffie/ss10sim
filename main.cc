@@ -172,6 +172,7 @@ static void system_reset(state_t *s) {
   s->fsr = 0;
   s->fq_addr = s->fq_insn = 0;
   s->mmu_ctrl = (s->mmu_ctrl & ~(MCR_E | MCR_NF)) | MCR_BMODE;
+  mmu_tlb_flush();
   s->pc = 0;
   s->npc = 4;
   s->error_mode = false;
@@ -412,7 +413,39 @@ int main(int argc, char *argv[]) {
   bool prev_exited = true;
   bool ckpt_armed = false;
   uint64_t n_exec = 0;       /* instructions executed here (icnt also counts halted time) */
+  /* lean loop (indysim's): between events, iterations of the loop below whose
+   * every per-boundary check is a no-op just run execSparc.  It stops at the
+   * first boundary where one could act -- the next timer event, a console poll
+   * point (icnt % 4096 == 0), a kbd or display pump time, the checkpoint
+   * icnt/exec count, max_icnt -- or when the CPU halts, asks for a reset or
+   * breaks, and that boundary runs the full loop body.  execSparc advances icnt
+   * by at most 1, so no boundary is skipped.  Off with the per-instruction
+   * debug outputs (--pctrace, --trace/--trace-from, --checkpoint-at-pc). */
+  const bool lean_ok = (pcfp == nullptr) and (trace_from == ~0ULL) and not have_ckpt_pc;
+  sun4m_t *const m4 = s->sun4m;
   while(not s->brk and s->icnt < max_icnt) {
+    if(lean_ok and not ckpt_armed) {
+      uint64_t lim = std::min(max_icnt, ckpt_icnt);
+      if(kbd_pos < kbd_keys.size()) {
+	lim = std::min(lim, kbd_next);
+      }
+      if(disp) {
+	lim = std::min(lim, next_pump);
+      }
+      if(con_fd >= 0) {
+	lim = std::min<uint64_t>(lim, (s->icnt & 4095) ? (s->icnt & ~4095ULL) + 4096 : s->icnt);
+      }
+      if(m4 and m4->cpu_halted) {
+	lim = s->icnt;
+      }
+      n_exec += execSparcRun(s, lim, (ckpt_exec > n_exec) ? ckpt_exec - n_exec : 0);
+      if(m4 and m4->reset_req) {
+	system_reset(s);
+      }
+      if(s->brk or s->icnt >= max_icnt) {
+	break;
+      }
+    }
     if(kbd_pos < kbd_keys.size() and s->icnt >= kbd_next and s->sun4m->kbd_ms.kbd_idle()) {
       const uint8_t k = kbd_keys[kbd_pos++];
       s->sun4m->kbd_ms.kbd_event(k & 0x7f, not (k & 0x80));

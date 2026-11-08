@@ -140,7 +140,7 @@ static inline bool asi_is_memory(uint32_t asi) {
 
 enum class acc_t { load, store, fetch };
 
-/* SRMMU table walk (no TLB: the ISS walks every access).  Returns FT_NONE with
+/* SRMMU table walk (on a soft-TLB miss; see mmu_xlate).  Returns FT_NONE with
  * the PTE, the PA it was read from and its level (0 = context, 4GB; 1 = 16MB;
  * 2 = 256KB; 3 = 4KB), else the fault type with *level where it hit. */
 static uint32_t srmmu_walk(state_t *s, uint32_t va, uint32_t *pte, uint64_t *pte_pa, uint32_t *level) {
@@ -276,8 +276,12 @@ static bool mmu_bus_error(state_t *s, uint64_t pa, bool is_write, bool is_exec, 
 }
 
 /* Translate va for an access through a memory ASI.  Returns FT_NONE and *pa, or
- * the fault type (already recorded in the fault status/address registers). */
-static uint32_t mmu_xlate(state_t *s, uint32_t asi, uint32_t va, acc_t acc, uint64_t *pa) {
+ * the fault type (already recorded in the fault status/address registers).
+ * *pte_out gets the PTE (R/M already updated) of a successful table walk, or 0
+ * when the translation did not come from the page tables (bypass, MMU off). */
+static __attribute__((noinline)) uint32_t mmu_xlate_slow(state_t *s, uint32_t asi, uint32_t va, acc_t acc,
+							 uint64_t *pa, uint32_t *pte_out) {
+  *pte_out = 0;
   if(asi_is_bypass(asi)) {
     *pa = (static_cast<uint64_t>(asi & 0xf) << 32) | va;
     return FT_NONE;
@@ -320,7 +324,81 @@ static uint32_t mmu_xlate(state_t *s, uint32_t asi, uint32_t va, acc_t acc, uint
     st_phys<uint32_t>(s, pte_pa, npte);
   }
   *pa = pte_pa_of(pte, level, va);
+  *pte_out = npte;
   return FT_NONE;
+}
+
+/* ---- software TLB (indysim's soft TLB, Bedichek's figure 5) ----------------
+ * A direct-mapped cache of successful table walks, keyed by 4K virtual page +
+ * context, one table for data and one for instruction fetch.  perm has bit
+ * (super ? 3 : 0) + acc for each access the PTE allows; the store bits are set
+ * only once the PTE's M bit is set, so the first store to a page still walks
+ * and sets M (R is set by the walk that fills the entry).  Like a real SRMMU
+ * TLB it does not snoop page-table writes: the OS flushes (ASI 3) after
+ * changing a PTE, and that empties it, as do context-table-pointer and
+ * control-register writes.  A context switch just misses (the context is in
+ * the tag). */
+struct stlb_t {
+  uint64_t tag;                        /* ((ctx << 20) | vpage) + 1; 0 = empty */
+  uint64_t ppage;                      /* PA of the 4K page */
+  uint32_t perm;
+};
+static const uint32_t STLB_SZ = 256;
+static stlb_t g_stlb[2][STLB_SZ];      /* [0] loads + stores, [1] instruction fetch */
+
+/* fetch-page cache (indysim's): the host bytes of the page the last fetch
+ * came from, when that is RAM or the PROM (no read side effects), keyed by
+ * page + context + supervisor bit.  Emptied with the soft TLB, which also
+ * covers MMU-off boot-mode fetches (an MCR write flushes). */
+static uint64_t g_fc_tag = 0;          /* ((s << 36) | (ctx << 20) | vpage) + 1; 0 = empty */
+static const uint8_t *g_fc_host = nullptr;
+
+void mmu_tlb_flush() {
+  memset(g_stlb, 0, sizeof(g_stlb));
+  g_fc_tag = 0;
+}
+
+static inline uint32_t stlb_perm(uint32_t pte) {
+  static const uint8_t perm_user[8] = {1, 3, 5, 7, 4, 1, 0, 0};
+  static const uint8_t perm_super[8] = {1, 3, 5, 7, 4, 3, 5, 7};
+  const uint32_t a = (pte >> 2) & 7;
+  /* rwx (bits 0-2) -> load/store/fetch (acc_t order: load 0, store 1, fetch 2) */
+  uint32_t u = perm_user[a], k = perm_super[a];
+  if(not (pte & (1u << 6))) {          /* not yet modified: a store must walk */
+    u &= ~2u;
+    k &= ~2u;
+  }
+  return u | (k << 3);
+}
+
+/* a soft-TLB hit for this access, with no side effects (a miss walks in
+ * mmu_xlate_slow) */
+static inline bool stlb_hit(const state_t *s, uint32_t asi, uint32_t va, acc_t acc, uint64_t *pa) {
+  const bool super = (asi == 0x9 or asi == 0xb);
+  const uint32_t need = 1u << ((super ? 3 : 0) + static_cast<uint32_t>(acc));
+  const uint64_t tag = ((static_cast<uint64_t>(s->mmu_ctx) << 20) | (va >> 12)) + 1;
+  const stlb_t &e = g_stlb[acc == acc_t::fetch][(va >> 12) & (STLB_SZ - 1)];
+  if(e.tag == tag and (e.perm & need) and (s->mmu_ctrl & MCR_E) and not asi_is_bypass(asi)) {
+    *pa = e.ppage | (va & 0xfffu);
+    return true;
+  }
+  return false;
+}
+
+static inline uint32_t mmu_xlate(state_t *s, uint32_t asi, uint32_t va, acc_t acc, uint64_t *pa) {
+  if(__builtin_expect(stlb_hit(s, asi, va, acc, pa), 1)) {
+    return FT_NONE;
+  }
+  const uint64_t tag = ((static_cast<uint64_t>(s->mmu_ctx) << 20) | (va >> 12)) + 1;
+  stlb_t &e = g_stlb[acc == acc_t::fetch][(va >> 12) & (STLB_SZ - 1)];
+  uint32_t pte = 0;
+  const uint32_t ft = mmu_xlate_slow(s, asi, va, acc, pa, &pte);
+  if(ft == FT_NONE and pte != 0) {
+    e.tag = tag;
+    e.ppage = *pa & ~0xfffULL;
+    e.perm = stlb_perm(pte);
+  }
+  return ft;
 }
 
 /* Viking cache/tag/flush ASIs: no caches are modeled, so loads read 0 (every tag
@@ -422,7 +500,8 @@ static void asi_store(state_t *s, uint32_t asi, uint32_t va, uint32_t v) {
     }
     return;
   }
-  if(asi == 0x3) {          /* TLB flush: there is no TLB */
+  if(asi == 0x3) {          /* TLB flush: empty the whole soft TLB, whatever the flush type */
+    mmu_tlb_flush();
     return;
   }
   if(asi == 0x4c) {
@@ -432,8 +511,8 @@ static void asi_store(state_t *s, uint32_t asi, uint32_t va, uint32_t v) {
   if(asi == 0x4) {
     switch(va & 0xf00)
       {
-      case 0x000: s->mmu_ctrl = v & 0x00ffffffu; return;   /* impl/ver read 0 */
-      case 0x100: s->mmu_ctpr = v & ~3u; return;
+      case 0x000: s->mmu_ctrl = v & 0x00ffffffu; mmu_tlb_flush(); return;   /* impl/ver read 0 */
+      case 0x100: s->mmu_ctpr = v & ~3u; mmu_tlb_flush(); return;
       case 0x200: s->mmu_ctx = v & 0xffff; return;
       case 0x300: case 0x400: return;
       default: break;
@@ -583,7 +662,7 @@ static inline uint32_t sub_cc(state_t *s, uint32_t a, uint32_t b, uint32_t cin) 
   return res;
 }
 
-static bool eval_icc(const state_t *s, uint32_t cond) {
+static inline bool eval_icc(const state_t *s, uint32_t cond) {
   bool r = false;
   switch(cond & 7)
     {
@@ -904,24 +983,37 @@ void take_interrupt(state_t *s, uint32_t level) {
   take_trap(s, TT_INTERRUPT_BASE + level);
 }
 
-void execSparc(state_t *s) {
-  if(not s->ext_irq and s->et and s->irl != 0 and (s->irl == 15 or s->irl > s->pil)) {
-    take_trap(s, TT_INTERRUPT_BASE + s->irl);
-    return;
-  }
-
-  const uint32_t pc = s->pc;
-  const uint32_t npc = s->npc;
+/* fetch-page cache miss: translate and read the instruction the slow way,
+ * taking the instruction access trap on a fault; on success refill the cache
+ * when the page is RAM or PROM.  Out of line to keep execSparc's path small. */
+static __attribute__((noinline)) bool fetch_refill(state_t *s, uint32_t pc, uint64_t ftag, uint32_t *inst) {
   uint64_t fetch_pa = 0;
   if(mmu_xlate(s, s->s ? 0x9 : 0x8, pc, acc_t::fetch, &fetch_pa) != FT_NONE) {
     take_trap(s, TT_IACCESS);
-    return;
+    return false;
   }
-  const uint32_t inst = ld_phys<uint32_t>(s, fetch_pa);
+  *inst = ld_phys<uint32_t>(s, fetch_pa);
   if(s->bus_error and mmu_bus_error(s, fetch_pa, false, true, false)) {
     take_trap(s, TT_IACCESS_ERROR);
-    return;
+    return false;
   }
+  const uint64_t ppage = fetch_pa & ~0xfffULL;
+  if(ppage + 4096 <= s->ram_size) {
+    g_fc_tag = ftag;
+    g_fc_host = s->mem.get_raw_ptr(ppage);
+  }
+  else if(s->sun4m and ppage >= SUN4M_PROM_BASE and ppage + 4096 <= SUN4M_PROM_BASE + SUN4M_PROM_SIZE) {
+    g_fc_tag = ftag;
+    g_fc_host = &s->sun4m->prom[ppage - SUN4M_PROM_BASE];
+  }
+  return true;
+}
+
+/* every instruction exec_fast does not finish: the full semantics, traps
+ * included.  inst was fetched from s->pc; nothing has changed yet. */
+static __attribute__((noinline)) void exec_slow(state_t *s, uint32_t inst) {
+  const uint32_t pc = s->pc;
+  const uint32_t npc = s->npc;
 
   uint32_t new_pc = npc;
   uint32_t new_npc = npc + 4;
@@ -1442,4 +1534,230 @@ void execSparc(state_t *s) {
   s->icnt++;
   s->pc = new_pc;
   s->npc = new_npc;
+}
+
+/* ---- fast path (indysim's "keep the hot path small") ---------------------
+ * The common instructions whose every precondition holds -- no trap, no
+ * window spill/fill, a load/store that hits the soft TLB and lands in RAM --
+ * finish here, inline in execSparc's small frame.  Anything else returns false
+ * before changing any state, and exec_slow does the whole instruction (it is
+ * the reference: these are its cases, specialised). */
+static inline void retire_fast(state_t *s, uint32_t new_pc, uint32_t new_npc) {
+  s->icnt++;
+  s->pc = new_pc;
+  s->npc = new_npc;
+}
+
+static inline void wr_fast(state_t *s, uint32_t r, uint32_t v) {
+  if(r != 0) {
+    s->gpr(r) = v;
+  }
+}
+
+static inline bool exec_fast(state_t *s, uint32_t inst) {
+  const uint32_t pc = s->pc;
+  const uint32_t npc = s->npc;
+  const uint32_t rd = (inst >> 25) & 31;
+  switch(inst >> 30)
+    {
+    case 0: {
+      const uint32_t op2 = (inst >> 22) & 7;
+      if(op2 == 4) {                                     /* sethi */
+	wr_fast(s, rd, inst << 10);
+	retire_fast(s, npc, npc + 4);
+	return true;
+      }
+      if(op2 != 2) {                                     /* FBfcc, CBccc, unimp: slow */
+	return false;
+      }
+      const uint32_t cond = (inst >> 25) & 15;           /* Bicc */
+      const bool annul = (inst >> 29) & 1;
+      const uint32_t tgt = pc + (static_cast<uint32_t>(static_cast<int32_t>(inst << 10) >> 10) << 2);
+      if(cond == 8) {
+	if(annul) {
+	  retire_fast(s, tgt, tgt + 4);
+	}
+	else {
+	  retire_fast(s, npc, tgt);
+	}
+      }
+      else if(eval_icc(s, cond)) {
+	retire_fast(s, npc, tgt);
+      }
+      else if(annul) {
+	retire_fast(s, npc + 4, npc + 8);
+      }
+      else {
+	retire_fast(s, npc, npc + 4);
+      }
+      return true;
+    }
+    case 1:                                              /* call */
+      wr_fast(s, 15, pc);
+      retire_fast(s, npc, pc + (inst << 2));
+      return true;
+    case 2: {
+      const uint32_t op3 = (inst >> 19) & 63;
+      const uint32_t a = s->gpr((inst >> 14) & 31);
+      const uint32_t b = ((inst >> 13) & 1) ? static_cast<uint32_t>(static_cast<int32_t>(inst << 19) >> 19)
+	: s->gpr(inst & 31);
+      uint32_t v;
+      switch(op3)
+	{
+	case 0x00: v = a + b; break;
+	case 0x01: v = a & b; break;
+	case 0x02: v = a | b; break;
+	case 0x03: v = a ^ b; break;
+	case 0x04: v = a - b; break;
+	case 0x05: v = a & ~b; break;
+	case 0x06: v = a | ~b; break;
+	case 0x07: v = ~(a ^ b); break;
+	case 0x10: v = add_cc(s, a, b, 0); break;
+	case 0x14: v = sub_cc(s, a, b, 0); break;
+	case 0x11: case 0x12: case 0x13: case 0x15: case 0x16: case 0x17:
+	  v = (op3 & 7) == 1 ? (a & b) : (op3 & 7) == 2 ? (a | b) : (op3 & 7) == 3 ? (a ^ b) :
+	    (op3 & 7) == 5 ? (a & ~b) : (op3 & 7) == 6 ? (a | ~b) : ~(a ^ b);
+	  set_nz(s, v);
+	  s->icc_v = false;
+	  s->icc_c = false;
+	  break;
+	case 0x25: v = a << (b & 31); break;
+	case 0x26: v = a >> (b & 31); break;
+	case 0x27: v = static_cast<uint32_t>(static_cast<int32_t>(a) >> (b & 31)); break;
+	case 0x38: {                                     /* jmpl */
+	  const uint32_t tgt = a + b;
+	  if(tgt & 3) {
+	    return false;
+	  }
+	  wr_fast(s, rd, pc);
+	  retire_fast(s, npc, tgt);
+	  return true;
+	}
+	case 0x3c: case 0x3d: {                          /* save restore, no window trap */
+	  const uint32_t ncwp = (op3 == 0x3c) ? (s->cwp + NWINDOWS - 1) % NWINDOWS : (s->cwp + 1) % NWINDOWS;
+	  if((s->wim >> ncwp) & 1) {
+	    return false;
+	  }
+	  s->cwp = ncwp;
+	  wr_fast(s, rd, a + b);
+	  retire_fast(s, npc, npc + 4);
+	  return true;
+	}
+	default:
+	  return false;
+	}
+      wr_fast(s, rd, v);
+      retire_fast(s, npc, npc + 4);
+      return true;
+    }
+    default: {
+      /* integer ld/st: ld ldub lduh ldd st stb sth std ldsb ldsh, and their
+       * alternate-space forms (supervisor, register address) through the
+       * bypass ASIs or a translated ASI that hits the soft TLB, to RAM */
+      const uint32_t op3 = (inst >> 19) & 63;
+      static const uint8_t SZ[16] = {4, 1, 2, 8, 4, 1, 2, 8, 0, 1, 2, 0, 0, 0, 0, 0};
+      const uint32_t sz = (op3 < 0x20) ? SZ[op3 & 0xf] : 0;
+      if(sz == 0 or (sz == 8 and (rd & 1))) {
+	return false;
+      }
+      const bool is_alt = op3 & 0x10;
+      if(is_alt and (not s->s or ((inst >> 13) & 1))) {
+	return false;
+      }
+      const uint32_t addr = s->gpr((inst >> 14) & 31) +
+	(((inst >> 13) & 1) ? static_cast<uint32_t>(static_cast<int32_t>(inst << 19) >> 19) : s->gpr(inst & 31));
+      if(addr & (sz - 1)) {
+	return false;
+      }
+      const bool is_store = (op3 & 0xc) == 0x4;
+      const uint32_t asi = is_alt ? ((inst >> 5) & 0xff) : (s->s ? 0xb : 0xa);
+      uint64_t pa;
+      if(asi_is_bypass(asi)) {
+	pa = (static_cast<uint64_t>(asi & 0xf) << 32) | addr;
+      }
+      else if(asi > 0xb or asi < 0x8 or not stlb_hit(s, asi, addr, is_store ? acc_t::store : acc_t::load, &pa)) {
+	return false;
+      }
+      if(pa + sz > s->ram_size) {
+	return false;
+      }
+      switch(op3 & 0xf)
+	{
+	case 0x00: wr_fast(s, rd, be(s->mem.get<uint32_t>(pa))); break;
+	case 0x01: wr_fast(s, rd, s->mem.get<uint8_t>(pa)); break;
+	case 0x02: wr_fast(s, rd, be(s->mem.get<uint16_t>(pa))); break;
+	case 0x09: wr_fast(s, rd, static_cast<uint32_t>(static_cast<int8_t>(s->mem.get<uint8_t>(pa)))); break;
+	case 0x0a: wr_fast(s, rd, static_cast<uint32_t>(static_cast<int16_t>(be(s->mem.get<uint16_t>(pa))))); break;
+	case 0x03: {
+	  const uint32_t hi = be(s->mem.get<uint32_t>(pa));
+	  const uint32_t lo = be(s->mem.get<uint32_t>(pa + 4));
+	  wr_fast(s, rd, hi);
+	  wr_fast(s, rd + 1, lo);
+	  break;
+	}
+	case 0x04: s->mem.set<uint32_t>(pa, be(s->gpr(rd))); break;
+	case 0x05: s->mem.set<uint8_t>(pa, static_cast<uint8_t>(s->gpr(rd))); break;
+	case 0x06: s->mem.set<uint16_t>(pa, be(static_cast<uint16_t>(s->gpr(rd)))); break;
+	case 0x07:
+	  s->mem.set<uint32_t>(pa, be(s->gpr(rd)));
+	  s->mem.set<uint32_t>(pa + 4, be(s->gpr(rd + 1)));
+	  break;
+	default:
+	  UNREACHABLE();
+	}
+      retire_fast(s, npc, npc + 4);
+      return true;
+    }
+    }
+}
+
+static inline __attribute__((always_inline)) void exec_one(state_t *s) {
+  if(not s->ext_irq and s->et and s->irl != 0 and (s->irl == 15 or s->irl > s->pil)) {
+    take_trap(s, TT_INTERRUPT_BASE + s->irl);
+    return;
+  }
+  const uint32_t pc = s->pc;
+  const uint64_t ftag = ((static_cast<uint64_t>(s->s) << 36) | (static_cast<uint64_t>(s->mmu_ctx) << 20) | (pc >> 12)) + 1;
+  uint32_t inst;
+  if(__builtin_expect(ftag == g_fc_tag, 1)) {
+    uint32_t w;
+    memcpy(&w, g_fc_host + (pc & 0xfffu), 4);
+    inst = be(w);
+  }
+  else if(not fetch_refill(s, pc, ftag, &inst)) {
+    return;
+  }
+  if(__builtin_expect(exec_fast(s, inst), 1)) {
+    return;
+  }
+  exec_slow(s, inst);
+}
+
+void execSparc(state_t *s) {
+  exec_one(s);
+}
+
+/* main's lean loop, here so exec_one inlines into it: run while icnt < lim, before
+ * the sun4m's next timer event, and for at most max_n instructions; stop early
+ * when the CPU halts, asks for a system reset or breaks.  Returns the number
+ * executed. */
+uint64_t execSparcRun(state_t *s, uint64_t lim, uint64_t max_n) {
+  uint64_t n = 0;
+  sun4m_t *const m4 = s->sun4m;
+  if(m4) {
+    while(s->icnt < lim and s->icnt < m4->next_event_icnt and n < max_n) {
+      exec_one(s);
+      n++;
+      if(__builtin_expect(m4->cpu_halted or m4->reset_req or s->brk, 0)) {
+	break;
+      }
+    }
+  }
+  else {
+    while(s->icnt < lim and n < max_n and not s->brk) {
+      exec_one(s);
+      n++;
+    }
+  }
+  return n;
 }

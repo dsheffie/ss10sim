@@ -180,8 +180,10 @@ std::ostream &operator<<(std::ostream &out, const state_t &s);
 
 void initState(state_t *s);
 void execSparc(state_t *s);
+uint64_t execSparcRun(state_t *s, uint64_t lim, uint64_t max_n);   /* main's lean loop (see main.cc) */
 /* take interrupt_level_n now, at s->pc (the co-sim checker, where the RTL took it) */
 void take_interrupt(state_t *s, uint32_t level);
+void mmu_tlb_flush();      /* empty the soft TLB (after any MMU state change made outside execSparc) */
 /* the instruction at va as the CPU would fetch it now (no side effects); false
  * if it does not translate or is not in RAM/PROM */
 bool debug_fetch(state_t *s, uint32_t va, uint32_t *insn);

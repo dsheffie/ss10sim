@@ -427,25 +427,31 @@ intctl_t::intctl_t() {
   check();
 }
 
-void intctl_t::check() {
-  uint32_t pending = master_pending & ~master_disabled;
-  for(uint32_t i = 0; i < SUN4M_MAX_CPUS; i++) {
-    uint32_t pil = 0;
-    if(pending and not (master_disabled & MASTER_DISABLE) and i == target_cpu) {
-      for(uint32_t j = 0; j < 32; j++) {
-	if(((pending >> j) & 1) and INTBIT_TO_LEVEL[j]) {
-	  pil |= 1u << INTBIT_TO_LEVEL[j];
-	}
-      }
+/* the level bits (1 << INTBIT_TO_LEVEL) of a set of master interrupt bits; a
+ * bit with level 0 contributes nothing.  Visits only the set bits: update_irqs
+ * runs check() six times per device event. */
+static inline uint32_t intbits_to_levels(uint32_t bits) {
+  uint32_t m = 0;
+  while(bits) {
+    const uint32_t j = __builtin_ctz(bits);
+    bits &= bits - 1;
+    if(INTBIT_TO_LEVEL[j]) {
+      m |= 1u << INTBIT_TO_LEVEL[j];
     }
+  }
+  return m;
+}
+
+void intctl_t::check() {
+  const uint32_t pending = master_pending & ~master_disabled;
+  const uint32_t target_pil = (pending and not (master_disabled & MASTER_DISABLE)) ? intbits_to_levels(pending) : 0;
+  const uint32_t target_shown = intbits_to_levels(master_pending);
+  for(uint32_t i = 0; i < SUN4M_MAX_CPUS; i++) {
+    uint32_t pil = (i == target_cpu) ? target_pil : 0;
     /* the slave register also shows the (unmasked) hard interrupts for display */
     slave_pending[i] &= CPU_SOFTIRQ_MASK | CPU_IRQ_INT15_IN | CPU_IRQ_TIMER_IN;
     if(i == target_cpu) {
-      for(uint32_t j = 0; j < 32; j++) {
-	if(((master_pending >> j) & 1) and INTBIT_TO_LEVEL[j]) {
-	  slave_pending[i] |= 1u << INTBIT_TO_LEVEL[j];
-	}
-      }
+      slave_pending[i] |= target_shown;
     }
     /* level 15 and the CPU timer are masked only by MASTER_DISABLE */
     if(not (master_disabled & MASTER_DISABLE)) {
