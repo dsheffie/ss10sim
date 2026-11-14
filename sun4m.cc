@@ -393,7 +393,13 @@ void escc_t::write(uint32_t off, uint32_t v) {
       fflush(stdout);
       if(line_icnt != nullptr) {
 	if(s.tx == '\n') {
-	  fprintf(stderr, "[console icnt %llu] %s\n", static_cast<unsigned long long>(*line_icnt), line.c_str());
+	  if(line_state != nullptr) {
+	    fprintf(stderr, "[console icnt %llu uicnt %llu] %s\n", static_cast<unsigned long long>(*line_icnt),
+		    static_cast<unsigned long long>(line_state->uicnt()), line.c_str());
+	  }
+	  else {
+	    fprintf(stderr, "[console icnt %llu] %s\n", static_cast<unsigned long long>(*line_icnt), line.c_str());
+	  }
 	  line.clear();
 	}
 	else if(s.tx >= 0x20 and s.tx < 0x7f and line.size() < 200) {
@@ -1136,8 +1142,10 @@ void sun4m_t::reset_devices(uint64_t now) {
   kbd_ms = escc_t(not have_kbd, false, have_kbd);
   {
     const uint64_t *li = serial.line_icnt;   /* (main --console-icount: kept across resets) */
+    const state_t *ls = serial.line_state;
     serial = escc_t(false, true);
     serial.line_icnt = li;
+    serial.line_state = ls;
   }
   aux1 = aux2 = mdm = 0;     /* qemu slavio_misc_reset: config, aux1/2, modem ctl */
   fdc = fdc_t();

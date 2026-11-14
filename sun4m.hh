@@ -42,6 +42,7 @@ public:
   /* main --console-icount: each console line also goes to stderr with the icount
    * it ended at (to find where in a run a message was printed) */
   const uint64_t *line_icnt = nullptr;
+  const state_t *line_state = nullptr;  /* with line_icnt: also stamp its user-mode icount */
   std::string line;
   bool serio = false;       /* a Sun keyboard on channel A, a Sun mouse on channel B */
   bool irq = false;

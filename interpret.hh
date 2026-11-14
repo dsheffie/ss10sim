@@ -159,6 +159,22 @@ public:
   int exit_code = 0;
   uint64_t icnt = 0;
   uint64_t ntraps = 0;       /* traps taken (interrupts included) */
+  /* user-mode instructions: kept at mode switches only (set_s), so the
+   * per-instruction path is untouched; uicnt() adds the current user stretch */
+  uint64_t uicnt_base = 0;   /* user insns retired before the current user stretch */
+  uint64_t u_enter = 0;      /* icnt when user mode was last entered */
+  uint64_t uicnt() const {
+    return uicnt_base + (s ? 0 : icnt - u_enter);
+  }
+  void set_s(bool v) {
+    if(s and not v) {
+      u_enter = icnt;
+    }
+    else if(not s and v) {
+      uicnt_base += icnt - u_enter;
+    }
+    s = v;
+  }
 
   /* --user: start in user mode and emulate the Linux sparc32 syscall ABI (ta 0x10)
    * plus the kernel's window spill/fill, so the same static ELF runs under

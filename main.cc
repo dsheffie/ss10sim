@@ -72,8 +72,9 @@ static bool attach_scsi(sun4m_t *m, const std::vector<std::string> &specs, scsi_
  * to RAM at vaddr - 0xf0000000 (KERNEL_LOAD_ADDR 0x4000 is where its text
  * lands), the command line to 0x7ff000.  The values match qemu -M SS-20 with
  * one CPU and -nographic. */
-static bool setup_fw_cfg(state_t *s, const std::string &kernel, const std::string &append) {
-  static const uint32_t KERNEL_LOAD_ADDR = 0x4000, CMDLINE_ADDR = 0x7ff000, INITRD_LOAD_ADDR = 0x800000;
+static bool setup_fw_cfg(state_t *s, const std::string &kernel, const std::string &append,
+			 const std::string &initrd, uint32_t INITRD_LOAD_ADDR) {
+  static const uint32_t KERNEL_LOAD_ADDR = 0x4000, CMDLINE_ADDR = 0x7ff000;
   static const uint16_t FW_CFG_SIGNATURE = 0x00, FW_CFG_ID = 0x01, FW_CFG_UUID = 0x02, FW_CFG_RAM_SIZE = 0x03,
     FW_CFG_NOGRAPHIC = 0x04, FW_CFG_NB_CPUS = 0x05, FW_CFG_MACHINE_ID = 0x06, FW_CFG_KERNEL_ADDR = 0x07,
     FW_CFG_KERNEL_SIZE = 0x08, FW_CFG_KERNEL_CMDLINE = 0x09, FW_CFG_INITRD_ADDR = 0x0a, FW_CFG_INITRD_SIZE = 0x0b,
@@ -125,6 +126,59 @@ static bool setup_fw_cfg(state_t *s, const std::string &kernel, const std::strin
     f.add_i32(FW_CFG_KERNEL_CMDLINE, 0);
     f.add_i32(FW_CFG_CMDLINE_SIZE, 0);
   }
+  /* --initrd: as qemu sun4m_hw_init, the image goes to RAM at INITRD_LOAD_ADDR (qemu's
+   * 0x800000 unless --initrd-addr; sparc32 Linux allocates its early page tables
+   * bottom-up just above a reserved initrd, which must stay inside the boot-time
+   * mapping, so a big initrd goes high in lowmem instead) and
+   * its address and size are patched into the kernel's "HdrS" boot header
+   * (head_32.S: sparc_ramdisk_image at +16, sparc_ramdisk_size at +20), found in
+   * the first 64 pages of the loaded kernel */
+  uint32_t initrd_size = 0;
+  if(not initrd.empty()) {
+    FILE *fp = fopen(initrd.c_str(), "rb");
+    if(fp == nullptr) {
+      fprintf(stderr, "ss10sim: cannot open initrd %s\n", initrd.c_str());
+      return false;
+    }
+    std::vector<uint8_t> buf;
+    uint8_t chunk[65536];
+    size_t n;
+    while((n = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+      buf.insert(buf.end(), chunk, chunk + n);
+    }
+    fclose(fp);
+    initrd_size = static_cast<uint32_t>(buf.size());
+    if(KERNEL_LOAD_ADDR + kernel_size > INITRD_LOAD_ADDR or INITRD_LOAD_ADDR + initrd_size > s->ram_size) {
+      fprintf(stderr, "ss10sim: initrd %s (%u bytes) does not fit at 0x%x\n", initrd.c_str(), initrd_size,
+	      INITRD_LOAD_ADDR);
+      return false;
+    }
+    for(uint32_t i = 0; i < initrd_size; i++) {
+      s->mem.set<uint8_t>(INITRD_LOAD_ADDR + i, buf[i]);
+    }
+    bool patched = false;
+    for(uint32_t i = 0; i < 64 * 4096; i += 4096) {
+      const uint32_t pa = KERNEL_LOAD_ADDR + i;
+      const uint32_t w = (static_cast<uint32_t>(s->mem.get<uint8_t>(pa)) << 24) |
+	(static_cast<uint32_t>(s->mem.get<uint8_t>(pa + 1)) << 16) |
+	(static_cast<uint32_t>(s->mem.get<uint8_t>(pa + 2)) << 8) | s->mem.get<uint8_t>(pa + 3);
+      if(w == 0x48647253u) {                       /* "HdrS" */
+	for(uint32_t k = 0; k < 4; k++) {
+	  s->mem.set<uint8_t>(pa + 16 + k, static_cast<uint8_t>(INITRD_LOAD_ADDR >> (24 - 8 * k)));
+	  s->mem.set<uint8_t>(pa + 20 + k, static_cast<uint8_t>(initrd_size >> (24 - 8 * k)));
+	}
+	patched = true;
+	break;
+      }
+    }
+    if(not patched) {
+      fprintf(stderr, "ss10sim: no HdrS header in the kernel's first 64 pages: initrd not passed\n");
+      return false;
+    }
+    fprintf(stderr, "ss10sim: initrd %s, %u bytes at 0x%x\n", initrd.c_str(), initrd_size, INITRD_LOAD_ADDR);
+  }
+  /* OpenBIOS is told no initrd: it maps one page by page into its own small heap and
+   * runs out ("out of malloc memory") on a large one; Linux needs only HdrS */
   f.add_i32(FW_CFG_INITRD_ADDR, INITRD_LOAD_ADDR);
   f.add_i32(FW_CFG_INITRD_SIZE, 0);
   f.add_i16(FW_CFG_BOOT_DEVICE, 'c');
@@ -161,7 +215,7 @@ static void system_reset(state_t *s) {
   memset(s->asr, 0, sizeof(s->asr));
   s->icc_n = s->icc_z = s->icc_v = s->icc_c = false;
   s->ef = false;
-  s->s = true;
+  s->set_s(true);
   s->ps = true;
   s->et = false;
   s->pil = 0;
@@ -189,7 +243,8 @@ int main(int argc, char *argv[]) {
   int64_t rtc_base = 1767225600;
   uint64_t ckpt_icnt = ~0ULL, ckpt_exec = ~0ULL;
   std::string ckpt_pc_s, ckpt_out = "ss10sim.ckpt", restore;
-  std::string kernel, append;
+  std::string kernel, append, initrd;
+  std::string initrd_addr_s = "0x800000";
   std::vector<std::string> scsi_disks, scsi_cdroms;
   std::vector<std::string> console_inputs;
   std::vector<uint64_t> console_input_ats;
@@ -220,6 +275,9 @@ int main(int argc, char *argv[]) {
       ("trace-from", po::value<uint64_t>(&trace_from), "print every executed instruction from this icnt on")
       ("kernel", po::value<std::string>(&kernel), "with --rom openbios-sparc32: a Linux vmlinux, booted through fw_cfg (qemu -kernel)")
       ("append", po::value<std::string>(&append), "with --kernel: the kernel command line (qemu -append)")
+      ("initrd", po::value<std::string>(&initrd), "with --kernel: an initrd / initramfs image, loaded at PA 0x800000 (qemu -initrd)")
+      ("initrd-addr", po::value<std::string>(&initrd_addr_s),
+       "with --initrd: load it at this PA instead (a big initrd: high in lowmem, e.g. 0x4000000)")
       ("scsi-disk", po::value<std::vector<std::string>>(&scsi_disks)->composing(),
        "[ID:]image: a SCSI disk on the ESP (default ID 0, then 1, ...; written in place)")
       ("cdrom-bs", po::value<uint32_t>(&cdrom_bs), "CD-ROM block size at power-on: 2048, or 512 as Sun's drives (Solaris 2.5.1)")
@@ -315,7 +373,7 @@ int main(int argc, char *argv[]) {
       return 1;
     }
     s->ram_size = static_cast<uint64_t>(ram_mb) << 20;
-    if(not setup_fw_cfg(s, kernel, append)) {
+    if(not setup_fw_cfg(s, kernel, append, initrd, static_cast<uint32_t>(strtoul(initrd_addr_s.c_str(), nullptr, 0)))) {
       return 1;
     }
     s->mmu_ctrl |= MCR_BMODE;
@@ -337,6 +395,8 @@ int main(int argc, char *argv[]) {
   /* the decoded-instruction cache trusts a filled slot: a restored RAM image
    * and every DMA write into RAM empty the slots they cover */
   predecode_flush_all();
+  s->uicnt_base = 0;             /* the user icount counts from here (a restore set S directly) */
+  s->u_enter = s->icnt;
   if(s->sun4m) {
     s->sun4m->dma_hook = predecode_dma_write;
   }
@@ -397,6 +457,7 @@ int main(int argc, char *argv[]) {
   uint64_t kbd_next = kbd_input_at;
   if(console_icount and s->sun4m) {
     s->sun4m->serial.line_icnt = &s->icnt;
+    s->sun4m->serial.line_state = s;
   }
   fb_display *disp = nullptr;
   if(s->sun4m and (s->sun4m->tcx or s->sun4m->cg14) and (sdl or not fb_png.empty())) {

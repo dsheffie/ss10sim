@@ -46,7 +46,7 @@ void state_t::set_psr(uint32_t v) {
   icc_c = (v >> 20) & 1;
   ef = (v >> 12) & 1;
   pil = (v >> 8) & 15;
-  s = (v >> 7) & 1;
+  set_s((v >> 7) & 1);
   ps = (v >> 6) & 1;
   et = (v >> 5) & 1;
   cwp = v & 31;
@@ -63,7 +63,7 @@ void initState(state_t *s) {
     /* a fresh Linux process: user mode, traps on, one valid window (CWP); the
      * window above it is the invalid one, so the first RESTORE past _start
      * underflows and N-1 SAVEs fit before the first spill */
-    s->s = false;
+    s->set_s(false);
     s->ps = false;
     s->et = true;
     s->wim = 1u << ((s->cwp + 1) % NWINDOWS);
@@ -565,7 +565,7 @@ static void take_trap(state_t *s, uint32_t tt) {
   }
   s->et = false;
   s->ps = s->s;
-  s->s = true;
+  s->set_s(true);
   s->cwp = (s->cwp + NWINDOWS - 1) % NWINDOWS;
   s->gpr(17) = s->pc;    /* %l1 */
   s->gpr(18) = s->npc;   /* %l2 */
@@ -1274,7 +1274,7 @@ static __attribute__((noinline)) void exec_slow(state_t *s, uint32_t inst) {
 	  }
 	  s->cwp = ncwp;
 	  s->et = true;
-	  s->s = s->ps;
+	  s->set_s(s->ps);
 	  new_npc = tgt;
 	  break;
 	}
