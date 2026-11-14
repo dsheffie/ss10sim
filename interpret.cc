@@ -1334,6 +1334,49 @@ static __attribute__((noinline)) void exec_slow(state_t *s, uint32_t inst) {
     }
     case 3: {
       const uint32_t a = s->gpr(rs1);
+      if(op3 == 0x3c) {
+	/* casa [rs1] asi, rs2, rd: LEON3's V8 CASA in V9's encoding, which Kodiak
+	 * implements (superdupersparc interpret.cc has the same rules).  The word
+	 * at [rs1] is compared with rs2; if they are equal rd is written there;
+	 * either way rd gets the old word.
+	 *   - supervisor only, except ASI 0xa (user data) with i = 0, as LEON3
+	 *   - i = 1 (V9's %asi form) or a non-memory ASI is illegal
+	 *   - cacheable memory only (RAM, MCR.DE, the PTE's C with the MMU on,
+	 *     MCR.AC with it off, never a bypass ASI): Kodiak's memory side cannot
+	 *     compare, so an uncached casa takes data_access_error with no access
+	 *     and no fault-status record */
+	const uint32_t asi = (inst >> 5) & 0xff;
+	if(not s->s and (imm or asi != 0xa)) {
+	  trap = TT_PRIVILEGED;
+	  break;
+	}
+	if(imm or not asi_is_memory(asi)) {
+	  trap = TT_ILLEGAL;
+	  break;
+	}
+	if(a & 3) {
+	  trap = TT_UNALIGNED;
+	  break;
+	}
+	uint64_t pa = 0;
+	uint32_t pte = 0;
+	if(mmu_xlate_slow(s, asi, a, acc_t::store, &pa, &pte) != FT_NONE) {
+	  if(not (s->mmu_ctrl & MCR_NF)) {
+	    trap = TT_DACCESS;
+	  }
+	  break;
+	}
+	const bool c = asi_is_bypass(asi) ? false : (s->mmu_ctrl & MCR_E) ? (((pte >> 7) & 1) != 0) :
+	  ((s->mmu_ctrl & (1u << 15)) != 0);                 /* Viking MCR.AC */
+	if(not c or not (s->mmu_ctrl & (1u << 8)) or (pa >= s->ram_size)) {   /* MCR.DE */
+	  trap = TT_DACCESS_ERROR;
+	  break;
+	}
+	const uint32_t old = ld_phys<uint32_t>(s, pa);
+	st_phys<uint32_t>(s, pa, (old == s->gpr(inst & 31)) ? s->gpr(rd) : old);
+	wr(rd, old);
+	break;
+      }
       const uint32_t addr = a + (imm ? simm13 : s->gpr(inst & 31));
       uint32_t asi = s->s ? 0xb : 0xa;
       const bool is_int = (op3 < 0x20);
