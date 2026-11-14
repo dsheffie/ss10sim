@@ -111,9 +111,14 @@ static T ld_phys(state_t *s, uint64_t pa) {
   return 0;
 }
 
+/* a store into a RAM page that holds decoded instructions empties its slots
+ * (the decoded-instruction cache, with execute below) */
+static inline void code_write_check(uint64_t pa);
+
 template <typename T>
 static void st_phys(state_t *s, uint64_t pa, T v) {
   if(pa < s->ram_size) {
+    code_write_check(pa);
     s->mem.set<T>(pa, be(v));
     return;
   }
@@ -983,34 +988,8 @@ void take_interrupt(state_t *s, uint32_t level) {
   take_trap(s, TT_INTERRUPT_BASE + level);
 }
 
-/* fetch-page cache miss: translate and read the instruction the slow way,
- * taking the instruction access trap on a fault; on success refill the cache
- * when the page is RAM or PROM.  Out of line to keep execSparc's path small. */
-static __attribute__((noinline)) bool fetch_refill(state_t *s, uint32_t pc, uint64_t ftag, uint32_t *inst) {
-  uint64_t fetch_pa = 0;
-  if(mmu_xlate(s, s->s ? 0x9 : 0x8, pc, acc_t::fetch, &fetch_pa) != FT_NONE) {
-    take_trap(s, TT_IACCESS);
-    return false;
-  }
-  *inst = ld_phys<uint32_t>(s, fetch_pa);
-  if(s->bus_error and mmu_bus_error(s, fetch_pa, false, true, false)) {
-    take_trap(s, TT_IACCESS_ERROR);
-    return false;
-  }
-  const uint64_t ppage = fetch_pa & ~0xfffULL;
-  if(ppage + 4096 <= s->ram_size) {
-    g_fc_tag = ftag;
-    g_fc_host = s->mem.get_raw_ptr(ppage);
-  }
-  else if(s->sun4m and ppage >= SUN4M_PROM_BASE and ppage + 4096 <= SUN4M_PROM_BASE + SUN4M_PROM_SIZE) {
-    g_fc_tag = ftag;
-    g_fc_host = &s->sun4m->prom[ppage - SUN4M_PROM_BASE];
-  }
-  return true;
-}
-
-/* every instruction exec_fast does not finish: the full semantics, traps
- * included.  inst was fetched from s->pc; nothing has changed yet. */
+/* every instruction the per-op handlers do not finish: the full semantics,
+ * traps included.  inst was fetched from s->pc; nothing has changed yet. */
 static __attribute__((noinline)) void exec_slow(state_t *s, uint32_t inst) {
   const uint32_t pc = s->pc;
   const uint32_t npc = s->npc;
@@ -1579,10 +1558,12 @@ static __attribute__((noinline)) void exec_slow(state_t *s, uint32_t inst) {
   s->npc = new_npc;
 }
 
-/* ---- fast path (indysim's "keep the hot path small") ---------------------
+/* ---- per-op handlers (indysim's predecode: one indirect dispatch per insn) --
  * The common instructions whose every precondition holds -- no trap, no
  * window spill/fill, a load/store that hits the soft TLB and lands in RAM --
- * finish here, inline in execSparc's small frame.  Anything else returns false
+ * finish in their own small handler, with the opcode-level choices (op3, the
+ * i bit, the branch condition) made once by decode_insn and baked into the
+ * template.  A handler whose run-time precondition fails calls exec_slow
  * before changing any state, and exec_slow does the whole instruction (it is
  * the reference: these are its cases, specialised). */
 static inline void retire_fast(state_t *s, uint32_t new_pc, uint32_t new_npc) {
@@ -1597,161 +1578,365 @@ static inline void wr_fast(state_t *s, uint32_t r, uint32_t v) {
   }
 }
 
-static inline bool exec_fast(state_t *s, uint32_t inst) {
+static inline uint32_t simm13_of(uint32_t inst) {
+  return static_cast<uint32_t>(static_cast<int32_t>(inst << 19) >> 19);
+}
+
+static void op_sethi(state_t *s, uint32_t inst) {
+  wr_fast(s, (inst >> 25) & 31, inst << 10);
+  retire_fast(s, s->npc, s->npc + 4);
+}
+
+template <uint32_t COND>
+static void op_bicc(state_t *s, uint32_t inst) {
   const uint32_t pc = s->pc;
   const uint32_t npc = s->npc;
+  const bool annul = (inst >> 29) & 1;
+  const uint32_t tgt = pc + (static_cast<uint32_t>(static_cast<int32_t>(inst << 10) >> 10) << 2);
+  if(COND == 8) {
+    if(annul) {
+      retire_fast(s, tgt, tgt + 4);
+    }
+    else {
+      retire_fast(s, npc, tgt);
+    }
+  }
+  else if(eval_icc(s, COND)) {
+    retire_fast(s, npc, tgt);
+  }
+  else if(annul) {
+    retire_fast(s, npc + 4, npc + 8);
+  }
+  else {
+    retire_fast(s, npc, npc + 4);
+  }
+}
+
+static void op_call(state_t *s, uint32_t inst) {
+  const uint32_t pc = s->pc;
+  wr_fast(s, 15, pc);
+  retire_fast(s, s->npc, pc + (inst << 2));
+}
+
+template <uint32_t OP3, bool IMM>
+static void op_alu(state_t *s, uint32_t inst) {
+  const uint32_t a = s->gpr((inst >> 14) & 31);
+  const uint32_t b = IMM ? simm13_of(inst) : s->gpr(inst & 31);
+  uint32_t v;
+  switch(OP3)
+    {
+    case 0x00: v = a + b; break;
+    case 0x01: v = a & b; break;
+    case 0x02: v = a | b; break;
+    case 0x03: v = a ^ b; break;
+    case 0x04: v = a - b; break;
+    case 0x05: v = a & ~b; break;
+    case 0x06: v = a | ~b; break;
+    case 0x07: v = ~(a ^ b); break;
+    case 0x10: v = add_cc(s, a, b, 0); break;
+    case 0x14: v = sub_cc(s, a, b, 0); break;
+    case 0x11: case 0x12: case 0x13: case 0x15: case 0x16: case 0x17:
+      v = (OP3 & 7) == 1 ? (a & b) : (OP3 & 7) == 2 ? (a | b) : (OP3 & 7) == 3 ? (a ^ b) :
+	(OP3 & 7) == 5 ? (a & ~b) : (OP3 & 7) == 6 ? (a | ~b) : ~(a ^ b);
+      set_nz(s, v);
+      s->icc_v = false;
+      s->icc_c = false;
+      break;
+    case 0x25: v = a << (b & 31); break;
+    case 0x26: v = a >> (b & 31); break;
+    case 0x27: v = static_cast<uint32_t>(static_cast<int32_t>(a) >> (b & 31)); break;
+    default:
+      UNREACHABLE();
+    }
+  wr_fast(s, (inst >> 25) & 31, v);
+  retire_fast(s, s->npc, s->npc + 4);
+}
+
+template <bool IMM>
+static void op_jmpl(state_t *s, uint32_t inst) {
+  const uint32_t tgt = s->gpr((inst >> 14) & 31) + (IMM ? simm13_of(inst) : s->gpr(inst & 31));
+  if(tgt & 3) {
+    exec_slow(s, inst);
+    return;
+  }
+  const uint32_t pc = s->pc;
+  wr_fast(s, (inst >> 25) & 31, pc);
+  retire_fast(s, s->npc, tgt);
+}
+
+/* save / restore without a window trap: the sources are read in the old
+ * window, rd is written in the new one */
+template <bool SAVE, bool IMM>
+static void op_saverestore(state_t *s, uint32_t inst) {
+  const uint32_t ncwp = SAVE ? (s->cwp + NWINDOWS - 1) % NWINDOWS : (s->cwp + 1) % NWINDOWS;
+  if((s->wim >> ncwp) & 1) {
+    exec_slow(s, inst);
+    return;
+  }
+  const uint32_t v = s->gpr((inst >> 14) & 31) + (IMM ? simm13_of(inst) : s->gpr(inst & 31));
+  s->cwp = ncwp;
+  wr_fast(s, (inst >> 25) & 31, v);
+  retire_fast(s, s->npc, s->npc + 4);
+}
+
+/* integer ld/st: ld ldub lduh ldd st stb sth std ldsb ldsh, and their
+ * alternate-space forms (supervisor, register address: decode_insn sends the
+ * i = 1 forms, and ldd/std with an odd rd, to exec_slow) through the bypass
+ * ASIs or a translated ASI that hits the soft TLB, to RAM */
+static constexpr uint8_t LDST_SZ[16] = {4, 1, 2, 8, 4, 1, 2, 8, 0, 1, 2, 0, 0, 0, 0, 0};
+
+template <uint32_t OP3, bool IMM>
+static void op_ldst(state_t *s, uint32_t inst) {
+  constexpr uint32_t sz = LDST_SZ[OP3 & 0xf];
+  constexpr bool is_alt = OP3 & 0x10;
+  constexpr bool is_store = (OP3 & 0xc) == 0x4;
   const uint32_t rd = (inst >> 25) & 31;
+  if(is_alt and not s->s) {
+    exec_slow(s, inst);
+    return;
+  }
+  const uint32_t addr = s->gpr((inst >> 14) & 31) + (IMM ? simm13_of(inst) : s->gpr(inst & 31));
+  if(addr & (sz - 1)) {
+    exec_slow(s, inst);
+    return;
+  }
+  const uint32_t asi = is_alt ? ((inst >> 5) & 0xff) : (s->s ? 0xb : 0xa);
+  uint64_t pa;
+  if(asi_is_bypass(asi)) {
+    pa = (static_cast<uint64_t>(asi & 0xf) << 32) | addr;
+  }
+  else if(asi > 0xb or asi < 0x8 or not stlb_hit(s, asi, addr, is_store ? acc_t::store : acc_t::load, &pa)) {
+    exec_slow(s, inst);
+    return;
+  }
+  if(pa + sz > s->ram_size) {
+    exec_slow(s, inst);
+    return;
+  }
+  if(is_store) {
+    code_write_check(pa);
+  }
+  switch(OP3 & 0xf)
+    {
+    case 0x00: wr_fast(s, rd, be(s->mem.get<uint32_t>(pa))); break;
+    case 0x01: wr_fast(s, rd, s->mem.get<uint8_t>(pa)); break;
+    case 0x02: wr_fast(s, rd, be(s->mem.get<uint16_t>(pa))); break;
+    case 0x09: wr_fast(s, rd, static_cast<uint32_t>(static_cast<int8_t>(s->mem.get<uint8_t>(pa)))); break;
+    case 0x0a: wr_fast(s, rd, static_cast<uint32_t>(static_cast<int16_t>(be(s->mem.get<uint16_t>(pa))))); break;
+    case 0x03: {
+      const uint32_t hi = be(s->mem.get<uint32_t>(pa));
+      const uint32_t lo = be(s->mem.get<uint32_t>(pa + 4));
+      wr_fast(s, rd, hi);
+      wr_fast(s, rd + 1, lo);
+      break;
+    }
+    case 0x04: s->mem.set<uint32_t>(pa, be(s->gpr(rd))); break;
+    case 0x05: s->mem.set<uint8_t>(pa, static_cast<uint8_t>(s->gpr(rd))); break;
+    case 0x06: s->mem.set<uint16_t>(pa, be(static_cast<uint16_t>(s->gpr(rd)))); break;
+    case 0x07:
+      s->mem.set<uint32_t>(pa, be(s->gpr(rd)));
+      s->mem.set<uint32_t>(pa + 4, be(s->gpr(rd + 1)));
+      break;
+    default:
+      UNREACHABLE();
+    }
+  retire_fast(s, s->npc, s->npc + 4);
+}
+
+/* ---- decode: the handler for an instruction word ------------------------- */
+typedef void (*dinst_fn_t)(state_t *s, uint32_t inst);
+
+#define DEC_IMM(H, ...) return imm ? H<__VA_ARGS__, true> : H<__VA_ARGS__, false>
+
+static dinst_fn_t decode_insn(uint32_t inst) {
+  static const dinst_fn_t BICC[16] = {
+    op_bicc<0>, op_bicc<1>, op_bicc<2>, op_bicc<3>, op_bicc<4>, op_bicc<5>, op_bicc<6>, op_bicc<7>,
+    op_bicc<8>, op_bicc<9>, op_bicc<10>, op_bicc<11>, op_bicc<12>, op_bicc<13>, op_bicc<14>, op_bicc<15>
+  };
+  const bool imm = (inst >> 13) & 1;
+  const uint32_t op3 = (inst >> 19) & 63;
   switch(inst >> 30)
     {
     case 0: {
       const uint32_t op2 = (inst >> 22) & 7;
-      if(op2 == 4) {                                     /* sethi */
-	wr_fast(s, rd, inst << 10);
-	retire_fast(s, npc, npc + 4);
-	return true;
+      if(op2 == 4) {
+	return op_sethi;
       }
-      if(op2 != 2) {                                     /* FBfcc, CBccc, unimp: slow */
-	return false;
+      if(op2 == 2) {
+	return BICC[(inst >> 25) & 15];
       }
-      const uint32_t cond = (inst >> 25) & 15;           /* Bicc */
-      const bool annul = (inst >> 29) & 1;
-      const uint32_t tgt = pc + (static_cast<uint32_t>(static_cast<int32_t>(inst << 10) >> 10) << 2);
-      if(cond == 8) {
-	if(annul) {
-	  retire_fast(s, tgt, tgt + 4);
-	}
-	else {
-	  retire_fast(s, npc, tgt);
-	}
-      }
-      else if(eval_icc(s, cond)) {
-	retire_fast(s, npc, tgt);
-      }
-      else if(annul) {
-	retire_fast(s, npc + 4, npc + 8);
-      }
-      else {
-	retire_fast(s, npc, npc + 4);
-      }
-      return true;
+      return exec_slow;                                  /* FBfcc, CBccc, unimp */
     }
-    case 1:                                              /* call */
-      wr_fast(s, 15, pc);
-      retire_fast(s, npc, pc + (inst << 2));
-      return true;
-    case 2: {
-      const uint32_t op3 = (inst >> 19) & 63;
-      const uint32_t a = s->gpr((inst >> 14) & 31);
-      const uint32_t b = ((inst >> 13) & 1) ? static_cast<uint32_t>(static_cast<int32_t>(inst << 19) >> 19)
-	: s->gpr(inst & 31);
-      uint32_t v;
+    case 1:
+      return op_call;
+    case 2:
       switch(op3)
 	{
-	case 0x00: v = a + b; break;
-	case 0x01: v = a & b; break;
-	case 0x02: v = a | b; break;
-	case 0x03: v = a ^ b; break;
-	case 0x04: v = a - b; break;
-	case 0x05: v = a & ~b; break;
-	case 0x06: v = a | ~b; break;
-	case 0x07: v = ~(a ^ b); break;
-	case 0x10: v = add_cc(s, a, b, 0); break;
-	case 0x14: v = sub_cc(s, a, b, 0); break;
-	case 0x11: case 0x12: case 0x13: case 0x15: case 0x16: case 0x17:
-	  v = (op3 & 7) == 1 ? (a & b) : (op3 & 7) == 2 ? (a | b) : (op3 & 7) == 3 ? (a ^ b) :
-	    (op3 & 7) == 5 ? (a & ~b) : (op3 & 7) == 6 ? (a | ~b) : ~(a ^ b);
-	  set_nz(s, v);
-	  s->icc_v = false;
-	  s->icc_c = false;
-	  break;
-	case 0x25: v = a << (b & 31); break;
-	case 0x26: v = a >> (b & 31); break;
-	case 0x27: v = static_cast<uint32_t>(static_cast<int32_t>(a) >> (b & 31)); break;
-	case 0x38: {                                     /* jmpl */
-	  const uint32_t tgt = a + b;
-	  if(tgt & 3) {
-	    return false;
-	  }
-	  wr_fast(s, rd, pc);
-	  retire_fast(s, npc, tgt);
-	  return true;
-	}
-	case 0x3c: case 0x3d: {                          /* save restore, no window trap */
-	  const uint32_t ncwp = (op3 == 0x3c) ? (s->cwp + NWINDOWS - 1) % NWINDOWS : (s->cwp + 1) % NWINDOWS;
-	  if((s->wim >> ncwp) & 1) {
-	    return false;
-	  }
-	  s->cwp = ncwp;
-	  wr_fast(s, rd, a + b);
-	  retire_fast(s, npc, npc + 4);
-	  return true;
-	}
+	case 0x00: DEC_IMM(op_alu, 0x00);
+	case 0x01: DEC_IMM(op_alu, 0x01);
+	case 0x02: DEC_IMM(op_alu, 0x02);
+	case 0x03: DEC_IMM(op_alu, 0x03);
+	case 0x04: DEC_IMM(op_alu, 0x04);
+	case 0x05: DEC_IMM(op_alu, 0x05);
+	case 0x06: DEC_IMM(op_alu, 0x06);
+	case 0x07: DEC_IMM(op_alu, 0x07);
+	case 0x10: DEC_IMM(op_alu, 0x10);
+	case 0x11: DEC_IMM(op_alu, 0x11);
+	case 0x12: DEC_IMM(op_alu, 0x12);
+	case 0x13: DEC_IMM(op_alu, 0x13);
+	case 0x14: DEC_IMM(op_alu, 0x14);
+	case 0x15: DEC_IMM(op_alu, 0x15);
+	case 0x16: DEC_IMM(op_alu, 0x16);
+	case 0x17: DEC_IMM(op_alu, 0x17);
+	case 0x25: DEC_IMM(op_alu, 0x25);
+	case 0x26: DEC_IMM(op_alu, 0x26);
+	case 0x27: DEC_IMM(op_alu, 0x27);
+	case 0x38: return imm ? op_jmpl<true> : op_jmpl<false>;
+	case 0x3c: DEC_IMM(op_saverestore, true);
+	case 0x3d: DEC_IMM(op_saverestore, false);
 	default:
-	  return false;
+	  return exec_slow;
 	}
-      wr_fast(s, rd, v);
-      retire_fast(s, npc, npc + 4);
-      return true;
-    }
     default: {
-      /* integer ld/st: ld ldub lduh ldd st stb sth std ldsb ldsh, and their
-       * alternate-space forms (supervisor, register address) through the
-       * bypass ASIs or a translated ASI that hits the soft TLB, to RAM */
-      const uint32_t op3 = (inst >> 19) & 63;
-      static const uint8_t SZ[16] = {4, 1, 2, 8, 4, 1, 2, 8, 0, 1, 2, 0, 0, 0, 0, 0};
-      const uint32_t sz = (op3 < 0x20) ? SZ[op3 & 0xf] : 0;
-      if(sz == 0 or (sz == 8 and (rd & 1))) {
-	return false;
+      const uint32_t sz = (op3 < 0x20) ? LDST_SZ[op3 & 0xf] : 0;
+      if(sz == 0 or (sz == 8 and (((inst >> 25) & 31) & 1)) or ((op3 & 0x10) and imm)) {
+	return exec_slow;
       }
-      const bool is_alt = op3 & 0x10;
-      if(is_alt and (not s->s or ((inst >> 13) & 1))) {
-	return false;
-      }
-      const uint32_t addr = s->gpr((inst >> 14) & 31) +
-	(((inst >> 13) & 1) ? static_cast<uint32_t>(static_cast<int32_t>(inst << 19) >> 19) : s->gpr(inst & 31));
-      if(addr & (sz - 1)) {
-	return false;
-      }
-      const bool is_store = (op3 & 0xc) == 0x4;
-      const uint32_t asi = is_alt ? ((inst >> 5) & 0xff) : (s->s ? 0xb : 0xa);
-      uint64_t pa;
-      if(asi_is_bypass(asi)) {
-	pa = (static_cast<uint64_t>(asi & 0xf) << 32) | addr;
-      }
-      else if(asi > 0xb or asi < 0x8 or not stlb_hit(s, asi, addr, is_store ? acc_t::store : acc_t::load, &pa)) {
-	return false;
-      }
-      if(pa + sz > s->ram_size) {
-	return false;
-      }
-      switch(op3 & 0xf)
+      switch(op3)
 	{
-	case 0x00: wr_fast(s, rd, be(s->mem.get<uint32_t>(pa))); break;
-	case 0x01: wr_fast(s, rd, s->mem.get<uint8_t>(pa)); break;
-	case 0x02: wr_fast(s, rd, be(s->mem.get<uint16_t>(pa))); break;
-	case 0x09: wr_fast(s, rd, static_cast<uint32_t>(static_cast<int8_t>(s->mem.get<uint8_t>(pa)))); break;
-	case 0x0a: wr_fast(s, rd, static_cast<uint32_t>(static_cast<int16_t>(be(s->mem.get<uint16_t>(pa))))); break;
-	case 0x03: {
-	  const uint32_t hi = be(s->mem.get<uint32_t>(pa));
-	  const uint32_t lo = be(s->mem.get<uint32_t>(pa + 4));
-	  wr_fast(s, rd, hi);
-	  wr_fast(s, rd + 1, lo);
-	  break;
-	}
-	case 0x04: s->mem.set<uint32_t>(pa, be(s->gpr(rd))); break;
-	case 0x05: s->mem.set<uint8_t>(pa, static_cast<uint8_t>(s->gpr(rd))); break;
-	case 0x06: s->mem.set<uint16_t>(pa, be(static_cast<uint16_t>(s->gpr(rd)))); break;
-	case 0x07:
-	  s->mem.set<uint32_t>(pa, be(s->gpr(rd)));
-	  s->mem.set<uint32_t>(pa + 4, be(s->gpr(rd + 1)));
-	  break;
+	case 0x00: DEC_IMM(op_ldst, 0x00);
+	case 0x01: DEC_IMM(op_ldst, 0x01);
+	case 0x02: DEC_IMM(op_ldst, 0x02);
+	case 0x03: DEC_IMM(op_ldst, 0x03);
+	case 0x04: DEC_IMM(op_ldst, 0x04);
+	case 0x05: DEC_IMM(op_ldst, 0x05);
+	case 0x06: DEC_IMM(op_ldst, 0x06);
+	case 0x07: DEC_IMM(op_ldst, 0x07);
+	case 0x09: DEC_IMM(op_ldst, 0x09);
+	case 0x0a: DEC_IMM(op_ldst, 0x0a);
+	case 0x10: return op_ldst<0x10, false>;
+	case 0x11: return op_ldst<0x11, false>;
+	case 0x12: return op_ldst<0x12, false>;
+	case 0x13: return op_ldst<0x13, false>;
+	case 0x14: return op_ldst<0x14, false>;
+	case 0x15: return op_ldst<0x15, false>;
+	case 0x16: return op_ldst<0x16, false>;
+	case 0x17: return op_ldst<0x17, false>;
+	case 0x19: return op_ldst<0x19, false>;
+	case 0x1a: return op_ldst<0x1a, false>;
 	default:
 	  UNREACHABLE();
 	}
-      retire_fast(s, npc, npc + 4);
-      return true;
     }
     }
+}
+
+#undef DEC_IMM
+
+/* ---- decoded-instruction cache (indysim's predecode; Bedichek, "decode once,
+ * execute many") ----------------------------------------------------------------
+ * One lazily allocated page of {handler, raw word} slots per 4 KB physical page
+ * that has executed code: RAM pages by PA, PROM pages separately (the PROM is
+ * never written once loaded).  A filled slot is trusted, so every write into
+ * RAM must empty the slots of a page holding decoded instructions: CPU stores
+ * (st_phys, op_ldst), ESP / Lance DMA (sun4m_t::dma_hook, set by main) and a
+ * checkpoint restore (predecode_flush_all).  The page stays allocated, so the
+ * fetch cache's pointer stays valid; the next fetch from it re-decodes.  This
+ * is stricter than SPARC requires (a FLUSH is needed after modifying code), and
+ * so behaves exactly as fetching the raw word every time did.
+ * Build with -DPREDECODE_CHECK to compare every slot with memory at fetch. */
+struct dinst_t {
+  dinst_fn_t fn;
+  uint32_t inst;
+};
+static const uint32_t DPAGE_SLOTS = 1024;
+static dinst_t *g_ram_dpages[1u << 20];                     /* by RAM page (RAM is below 4 GB) */
+static uint8_t g_code_page[1u << 20];                       /* that page has filled slots */
+static dinst_t *g_prom_dpages[SUN4M_PROM_SIZE >> 12];
+static dinst_t *g_fc_dpage = nullptr;                       /* the fetch cache page's slots */
+static uint8_t *g_fc_codebit = nullptr;                     /* its g_code_page byte (PROM: a dummy) */
+static uint8_t g_prom_codebit = 0;
+static dinst_t g_uncached_slot;                             /* a fetch from neither RAM nor PROM */
+
+static __attribute__((noinline)) void code_page_written(uint32_t ppn) {
+  memset(g_ram_dpages[ppn], 0, DPAGE_SLOTS * sizeof(dinst_t));
+  g_code_page[ppn] = 0;
+}
+
+static inline void code_write_check(uint64_t pa) {
+  const uint32_t ppn = static_cast<uint32_t>(pa >> 12);
+  if(__builtin_expect(g_code_page[ppn], 0)) {
+    code_page_written(ppn);
+  }
+}
+
+void predecode_dma_write(void *, uint64_t pa, const uint8_t *, uint32_t len) {
+  for(uint64_t p = pa & ~0xfffULL; p < pa + len; p += 4096) {
+    code_write_check(p);
+  }
+}
+
+void predecode_flush_all() {
+  for(uint32_t ppn = 0; ppn < (1u << 20); ppn++) {
+    if(g_code_page[ppn]) {
+      code_page_written(ppn);
+    }
+  }
+}
+
+static dinst_t *dpage_for(dinst_t **slot) {
+  if(*slot == nullptr) {
+    *slot = new dinst_t[DPAGE_SLOTS]();
+  }
+  return *slot;
+}
+
+/* fetch-page cache miss: translate and read the instruction the slow way,
+ * taking the instruction access trap on a fault (nullptr).  On success refill
+ * the cache when the page is RAM or PROM and return its slot; otherwise return
+ * g_uncached_slot, decoded on the spot.  Out of line to keep exec_one small. */
+static __attribute__((noinline)) dinst_t *fetch_refill(state_t *s, uint32_t pc, uint64_t ftag) {
+  uint64_t fetch_pa = 0;
+  if(mmu_xlate(s, s->s ? 0x9 : 0x8, pc, acc_t::fetch, &fetch_pa) != FT_NONE) {
+    take_trap(s, TT_IACCESS);
+    return nullptr;
+  }
+  const uint32_t inst = ld_phys<uint32_t>(s, fetch_pa);
+  if(s->bus_error and mmu_bus_error(s, fetch_pa, false, true, false)) {
+    take_trap(s, TT_IACCESS_ERROR);
+    return nullptr;
+  }
+  const uint64_t ppage = fetch_pa & ~0xfffULL;
+  if(ppage + 4096 <= s->ram_size) {
+    g_fc_tag = ftag;
+    g_fc_host = s->mem.get_raw_ptr(ppage);
+    g_fc_dpage = dpage_for(&g_ram_dpages[ppage >> 12]);
+    g_fc_codebit = &g_code_page[ppage >> 12];
+  }
+  else if(s->sun4m and ppage >= SUN4M_PROM_BASE and ppage + 4096 <= SUN4M_PROM_BASE + SUN4M_PROM_SIZE) {
+    g_fc_tag = ftag;
+    g_fc_host = &s->sun4m->prom[ppage - SUN4M_PROM_BASE];
+    g_fc_dpage = dpage_for(&g_prom_dpages[(ppage - SUN4M_PROM_BASE) >> 12]);
+    g_fc_codebit = &g_prom_codebit;
+  }
+  else {
+    g_uncached_slot.inst = inst;
+    g_uncached_slot.fn = decode_insn(inst);
+    return &g_uncached_slot;
+  }
+  return &g_fc_dpage[(pc & 0xfffu) >> 2];
+}
+
+static inline uint32_t fc_word(uint32_t pc) {
+  uint32_t w;
+  memcpy(&w, g_fc_host + (pc & 0xfffu), 4);
+  return be(w);
+}
+
+static __attribute__((noinline)) void fill_slot(dinst_t *di, uint32_t pc) {
+  di->inst = fc_word(pc);
+  di->fn = decode_insn(di->inst);
+  *g_fc_codebit = 1;
 }
 
 static inline __attribute__((always_inline)) void exec_one(state_t *s) {
@@ -1761,19 +1946,27 @@ static inline __attribute__((always_inline)) void exec_one(state_t *s) {
   }
   const uint32_t pc = s->pc;
   const uint64_t ftag = ((static_cast<uint64_t>(s->s) << 36) | (static_cast<uint64_t>(s->mmu_ctx) << 20) | (pc >> 12)) + 1;
-  uint32_t inst;
+  dinst_t *di;
   if(__builtin_expect(ftag == g_fc_tag, 1)) {
-    uint32_t w;
-    memcpy(&w, g_fc_host + (pc & 0xfffu), 4);
-    inst = be(w);
+    di = &g_fc_dpage[(pc & 0xfffu) >> 2];
   }
-  else if(not fetch_refill(s, pc, ftag, &inst)) {
-    return;
+  else {
+    di = fetch_refill(s, pc, ftag);
+    if(di == nullptr) {
+      return;
+    }
   }
-  if(__builtin_expect(exec_fast(s, inst), 1)) {
-    return;
+  if(__builtin_expect(di->fn == nullptr, 0)) {
+    fill_slot(di, pc);
   }
-  exec_slow(s, inst);
+#ifdef PREDECODE_CHECK
+  if(di != &g_uncached_slot and di->inst != fc_word(pc)) {
+    fprintf(stderr, "predecode: stale slot at pc 0x%x icnt %llu: 0x%08x, memory 0x%08x\n", pc,
+	    static_cast<unsigned long long>(s->icnt), di->inst, fc_word(pc));
+    abort();
+  }
+#endif
+  di->fn(s, di->inst);
 }
 
 void execSparc(state_t *s) {

@@ -184,6 +184,11 @@ uint64_t execSparcRun(state_t *s, uint64_t lim, uint64_t max_n);   /* main's lea
 /* take interrupt_level_n now, at s->pc (the co-sim checker, where the RTL took it) */
 void take_interrupt(state_t *s, uint32_t level);
 void mmu_tlb_flush();      /* empty the soft TLB (after any MMU state change made outside execSparc) */
+/* the decoded-instruction cache (interpret.cc): empty every decoded page (after
+ * RAM was rewritten wholesale, e.g. a checkpoint restore), and the
+ * sun4m_t::dma_hook that empties the pages a DMA write covers */
+void predecode_flush_all();
+void predecode_dma_write(void *ctx, uint64_t pa, const uint8_t *buf, uint32_t len);
 /* the instruction at va as the CPU would fetch it now (no side effects); false
  * if it does not translate or is not in RAM/PROM */
 bool debug_fetch(state_t *s, uint32_t va, uint32_t *insn);

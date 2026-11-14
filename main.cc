@@ -334,6 +334,12 @@ int main(int argc, char *argv[]) {
   if(not restore.empty() and not load_checkpoint(restore.c_str(), s)) {
     return 1;
   }
+  /* the decoded-instruction cache trusts a filled slot: a restored RAM image
+   * and every DMA write into RAM empty the slots they cover */
+  predecode_flush_all();
+  if(s->sun4m) {
+    s->sun4m->dma_hook = predecode_dma_write;
+  }
   /* --console-input files, typed in turn: the next opens when one is used up */
   if(console_input_ats.size() > console_inputs.size()) {
     fprintf(stderr, "ss10sim: more --console-input-at than --console-input\n");
