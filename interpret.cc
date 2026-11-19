@@ -5,10 +5,13 @@
 #include <cfenv>
 #include <iostream>
 #include <iomanip>
+#include <vector>
+#include <algorithm>
 
 #include "interpret.hh"
 #include "sun4m.hh"
 #include "helper.hh"
+#include "disassemble.hh"
 #include "globals.hh"
 
 /* SPARC V8 golden ISS.  References: The SPARC Architecture Manual, Version 8
@@ -44,7 +47,7 @@ void state_t::set_psr(uint32_t v) {
   icc_z = (v >> 22) & 1;
   icc_v = (v >> 21) & 1;
   icc_c = (v >> 20) & 1;
-  ef = (v >> 12) & 1;
+  ef = ((v >> 12) & 1) and not no_fpu;
   pil = (v >> 8) & 15;
   set_s((v >> 7) & 1);
   ps = (v >> 6) & 1;
@@ -94,17 +97,43 @@ static inline uint8_t  be(uint8_t x)  { return x; }
 static inline uint16_t be(uint16_t x) { return __builtin_bswap16(x); }
 static inline uint32_t be(uint32_t x) { return __builtin_bswap32(x); }
 
+/* the board DMA race model (--dma-race, below the decoded-instruction cache):
+ * nonzero while a DMA-written line is still inside its board window */
+static uint32_t g_dw_active = 0;
+static void dma_race_access_slow(state_t *s, uint64_t pa, bool is_store);
+static void dma_race_close(state_t *s);
+/* --watch-pa: every CPU access to [g_watch_lo, g_watch_hi) is logged (pc, icnt, the
+ * aligned word before the access); g_watch_on folds into the same cheap gate */
+static uint32_t g_watch_on = 0;
+static uint64_t g_watch_lo = 0, g_watch_hi = 0;
+static void watch_access(state_t *s, uint64_t pa, bool is_store);
+static inline void dma_race_access(state_t *s, uint64_t pa, bool is_store) {
+  if(__builtin_expect((g_dw_active | g_watch_on) != 0, 0)) {
+    if(g_watch_on and pa >= g_watch_lo and pa < g_watch_hi) {
+      watch_access(s, pa, is_store);
+    }
+    if(g_dw_active != 0) {
+      dma_race_access_slow(s, pa, is_store);
+    }
+  }
+}
+
 /* Physical space is 36 bits.  RAM is sparse_mem below ram_size (sun4m RAM sits
  * at PA 0); everything else, including PA >= 4GB, is sun4m device space. */
 template <typename T>
 static T ld_phys(state_t *s, uint64_t pa) {
   if(pa < s->ram_size) {
+    dma_race_access(s, pa, false);
     return be(s->mem.get<T>(pa));
   }
   if(s->dev) {
     return static_cast<T>(s->dev->read(s, pa, sizeof(T), &s->bus_error));
   }
   if(s->sun4m) {
+    /* on the board the ARM answers a device load only after its DMA call returns */
+    if(__builtin_expect(g_dw_active != 0, 0)) {
+      dma_race_close(s);
+    }
     return static_cast<T>(s->sun4m->read(s, pa, sizeof(T), &s->bus_error));
   }
   fprintf(stderr, "ISS: load from unmodeled pa 0x%llx pc 0x%x\n", static_cast<unsigned long long>(pa), s->pc);
@@ -119,6 +148,7 @@ template <typename T>
 static void st_phys(state_t *s, uint64_t pa, T v) {
   if(pa < s->ram_size) {
     code_write_check(pa);
+    dma_race_access(s, pa, true);
     s->mem.set<T>(pa, be(v));
     return;
   }
@@ -1587,6 +1617,27 @@ static void op_sethi(state_t *s, uint32_t inst) {
   retire_fast(s, s->npc, s->npc + 4);
 }
 
+/* nop = sethi 0,%g0: op_sethi plus the user-mode nop counts.  DS = the word
+ * before it is a CTI, i.e. it is that CTI's delay slot (fill_slot decides) */
+template <bool DS>
+static void op_nop(state_t *s, uint32_t) {
+  if(not s->s) {
+    s->unop++;
+    if(DS) {
+      s->unop_ds++;
+    }
+  }
+  retire_fast(s, s->npc, s->npc + 4);
+}
+
+static inline bool is_cti(uint32_t inst) {
+  const uint32_t op = inst >> 30;
+  const uint32_t op2 = (inst >> 22) & 7;
+  const uint32_t op3 = (inst >> 19) & 0x3f;
+  return (op == 1) or ((op == 0) and ((op2 == 2) or (op2 == 6) or (op2 == 7))) or
+    ((op == 2) and ((op3 == 0x38) or (op3 == 0x39)));
+}
+
 template <uint32_t COND>
 static void op_bicc(state_t *s, uint32_t inst) {
   const uint32_t pc = s->pc;
@@ -1716,6 +1767,7 @@ static void op_ldst(state_t *s, uint32_t inst) {
   if(is_store) {
     code_write_check(pa);
   }
+  dma_race_access(s, pa, is_store);
   switch(OP3 & 0xf)
     {
     case 0x00: wr_fast(s, rd, be(s->mem.get<uint32_t>(pa))); break;
@@ -1876,6 +1928,231 @@ void predecode_dma_write(void *, uint64_t pa, const uint8_t *, uint32_t len) {
   }
 }
 
+/* ---- board DMA race model (--dma-race) -----------------------------------------
+ * Kodiak's ARM does each page chunk of a DMA write (sun4m_t::iommu_dma) as: snoop
+ * the IOMMU PTE, snoop (WBINV) every 16-byte line of the chunk one at a time,
+ * memcpy the chunk into DRAM, then snoop every line again -- while the core keeps
+ * running.  A line the core touches after its first snoop but before the memcpy
+ * is filled with the OLD bytes; if the core then stores anywhere in it before the
+ * second snoop, that snoop writes the whole dirty line back over the DMA bytes.
+ * ss10sim does the DMA in one step, so here each chunk gets the board's timeline
+ * in instructions (snoop_insns per snoop, copy_insns per line copied) laid after
+ * the previous chunk's, and every CPU RAM access is checked against the lines
+ * still inside their window.  apply = put the old bytes back, as the board would.
+ * Line granularity is the snoop's, 16 bytes. */
+struct dma_watch_t {
+  uint64_t line, t1, tm, t2, dma_id;
+  uint8_t old[16];
+  uint16_t mask;          /* bytes of the line the DMA wrote */
+  bool filled, stale, dirty;
+  uint32_t fill_pc, store_pc;
+  uint64_t fill_icnt, store_icnt;
+};
+static uint64_t g_dr_snoop = 0, g_dr_copy = 0;
+static bool g_dr_apply = false;
+static std::vector<dma_watch_t> g_dw;
+static uint64_t g_dr_cursor = 0, g_dr_id = 0;
+static uint64_t g_dr_lines = 0, g_dr_stale = 0, g_dr_clobbers = 0;
+struct dma_snap_t {
+  uint64_t pa;
+  uint32_t len;
+  uint8_t b[4096];
+};
+static dma_snap_t g_snap[4];
+static uint32_t g_snap_next = 0;
+
+void watch_config(uint64_t pa, uint64_t len) {
+  g_watch_lo = pa;
+  g_watch_hi = pa + len;
+  g_watch_on = (len != 0);
+}
+
+/* dbg (--esp-irq-at-pc): a store by this pc to the watched range releases a
+ * held ESP interrupt (sun4m.hh esp_busy_until_ns) at once -- an interrupt forced into
+ * the window that store opens */
+static uint32_t g_irq_at_pc = 0;
+void watch_irq_at_pc(uint32_t pc) {
+  g_irq_at_pc = pc;
+}
+
+static void watch_access(state_t *s, uint64_t pa, bool is_store) {
+  if(is_store and (s->pc == g_irq_at_pc) and (s->sun4m != nullptr) and (s->sun4m->esp_irq_at_ns != ~0ULL)) {
+    s->sun4m->esp_irq_at_ns = 0;
+    s->sun4m->esp_busy_until_ns = 0;
+    s->sun4m->next_event_ns = 0;      /* timer_event at the next instruction */
+    s->sun4m->next_event_icnt = 0;
+    fprintf(stderr, "watch: icnt %llu pc %08x forces the held ESP interrupt\n",
+	    static_cast<unsigned long long>(s->icnt), s->pc);
+  }
+  const uint64_t w = pa & ~3ULL;
+  const uint32_t v = (static_cast<uint32_t>(s->mem.get<uint8_t>(w)) << 24) | (s->mem.get<uint8_t>(w + 1) << 16) |
+		     (s->mem.get<uint8_t>(w + 2) << 8) | s->mem.get<uint8_t>(w + 3);
+  uint32_t insn = 0;
+  debug_fetch(s, s->pc, &insn);
+  fprintf(stderr, "watch: icnt %llu pc %08x %s pa %llx word %08x : %s\n", static_cast<unsigned long long>(s->icnt),
+	  s->pc, is_store ? "ST" : "ld", static_cast<unsigned long long>(pa), v, getAsmString(insn, s->pc).c_str());
+}
+
+void dma_race_config(uint64_t snoop_insns, uint64_t copy_insns, bool apply) {
+  g_dr_snoop = snoop_insns;
+  g_dr_copy = copy_insns;
+  g_dr_apply = apply;
+}
+
+/* the line's window is over: a stale fill made dirty is the clobber */
+static void dma_watch_retire(state_t *s, dma_watch_t &w) {
+  if(w.stale and w.dirty) {
+    uint32_t differ = 0;
+    for(uint32_t i = 0; i < 16; i++) {
+      if(((w.mask >> i) & 1) and (s->mem.get<uint8_t>(w.line + i) != w.old[i])) {
+        differ++;
+      }
+    }
+    ++g_dr_clobbers;
+    fprintf(stderr, "dmarace: CLOBBER line %llx dma#%llu mask %04x: stale fill pc %08x icnt %llu (%lld after snoop1, %lld before memcpy), "
+            "store pc %08x icnt %llu, %u DMA bytes differ%s\n",
+            static_cast<unsigned long long>(w.line), static_cast<unsigned long long>(w.dma_id), w.mask, w.fill_pc,
+            static_cast<unsigned long long>(w.fill_icnt), static_cast<long long>(w.fill_icnt - w.t1),
+            static_cast<long long>(w.tm - w.fill_icnt), w.store_pc, static_cast<unsigned long long>(w.store_icnt), differ,
+            (g_dr_apply and differ) ? ", reverted" : "");
+    if(g_dr_apply and differ) {
+      code_write_check(w.line);
+      for(uint32_t i = 0; i < 16; i++) {
+        if((w.mask >> i) & 1) {
+          s->mem.set<uint8_t>(w.line + i, w.old[i]);
+        }
+      }
+    }
+  }
+}
+
+static void dma_race_expire(state_t *s) {
+  size_t j = 0;
+  for(size_t i = 0; i < g_dw.size(); i++) {
+    if(s->icnt >= g_dw[i].t2) {
+      dma_watch_retire(s, g_dw[i]);
+    }
+    else {
+      g_dw[j++] = g_dw[i];
+    }
+  }
+  g_dw.resize(j);
+  g_dw_active = static_cast<uint32_t>(g_dw.size());
+}
+
+/* every window is over now: the ARM has finished its DMA calls */
+static void dma_race_close(state_t *s) {
+  for(dma_watch_t &w : g_dw) {
+    w.t2 = std::min(w.t2, s->icnt);
+  }
+  g_dr_cursor = std::min(g_dr_cursor, s->icnt);
+  dma_race_expire(s);
+}
+
+/* the CPU takes an interrupt with the ESP's DMA interrupt up: on the board the
+ * ARM raises it only after the DMA's second snoop pass, so every window is over */
+static void dma_race_interrupt(state_t *s) {
+  if(g_dw_active != 0 and s->sun4m != nullptr and s->sun4m->espdma.irq) {
+    dma_race_close(s);
+  }
+}
+
+static void dma_race_access_slow(state_t *s, uint64_t pa, bool is_store) {
+  dma_race_expire(s);
+  const uint64_t line = pa & ~15ULL;
+  for(dma_watch_t &w : g_dw) {
+    if(w.line != line or s->icnt < w.t1) {
+      continue;          /* before its first snoop, the snoop writes the core's copy back first */
+    }
+    if(not w.filled) {
+      w.filled = true;
+      w.stale = s->icnt < w.tm;
+      w.fill_pc = s->pc;
+      w.fill_icnt = s->icnt;
+      if(w.stale) {
+        ++g_dr_stale;
+      }
+    }
+    if(is_store and w.stale and not w.dirty) {
+      w.dirty = true;
+      w.store_pc = s->pc;
+      w.store_icnt = s->icnt;
+    }
+  }
+}
+
+/* sun4m_t::dma_snoop: called before (and again after) every chunk's memcpy, and
+ * for DMA reads and IOMMU PTEs; keep the bytes, the write's hook finds the copy
+ * taken before its memcpy as the one that differs from what it wrote */
+void dma_race_snoop(void *ctx, uint64_t pa, uint32_t len) {
+  state_t *s = static_cast<state_t*>(ctx);
+  if(g_dr_snoop == 0 or len > 4096 or pa + len > s->ram_size) {
+    return;
+  }
+  dma_snap_t &n = g_snap[g_snap_next++ & 3];
+  n.pa = pa;
+  n.len = len;
+  for(uint32_t i = 0; i < len; i++) {
+    n.b[i] = s->mem.get<uint8_t>(pa + i);
+  }
+}
+
+/* sun4m_t::dma_hook: one chunk of a DMA write has landed in RAM */
+void dma_race_write(void *ctx, uint64_t pa, const uint8_t *buf, uint32_t len) {
+  state_t *s = static_cast<state_t*>(ctx);
+  predecode_dma_write(ctx, pa, buf, len);
+  if(g_watch_on and pa < g_watch_hi and pa + len > g_watch_lo) {
+    fprintf(stderr, "watch: icnt %llu DMA write pa %llx len %u\n", static_cast<unsigned long long>(s->icnt),
+	    static_cast<unsigned long long>(pa), len);
+  }
+  if(g_dr_snoop == 0) {
+    return;
+  }
+  const dma_snap_t *pre = nullptr;
+  for(uint32_t k = 1; k <= 4; k++) {
+    const dma_snap_t &c = g_snap[(g_snap_next - k) & 3];
+    if(c.pa == pa and c.len == len and memcmp(c.b, buf, len) != 0) {
+      pre = &c;
+      break;
+    }
+  }
+  dma_race_expire(s);
+  const uint64_t first = pa & ~15ULL;
+  const uint64_t lines = ((pa + len + 15) & ~15ULL) - first;
+  const uint64_t nlines = lines >> 4;
+  const uint64_t t0 = std::max(s->icnt, g_dr_cursor) + g_dr_snoop;    /* the PTE snoop */
+  const uint64_t tm = t0 + nlines * g_dr_snoop + nlines * g_dr_copy;
+  ++g_dr_id;
+  for(uint64_t i = 0; i < nlines; i++) {
+    dma_watch_t w;
+    memset(&w, 0, sizeof(w));
+    w.line = first + 16 * i;
+    w.t1 = t0 + (i + 1) * g_dr_snoop;
+    w.tm = tm;
+    w.t2 = tm + (i + 1) * g_dr_snoop;
+    w.dma_id = g_dr_id;
+    for(uint32_t b = 0; b < 16; b++) {
+      const uint64_t a = w.line + b;
+      if(a >= pa and a < pa + len) {
+        w.mask |= static_cast<uint16_t>(1u << b);
+        w.old[b] = pre ? pre->b[a - pa] : buf[a - pa];
+      }
+    }
+    g_dw.push_back(w);
+  }
+  g_dr_lines += nlines;
+  g_dr_cursor = tm + nlines * g_dr_snoop;
+  g_dw_active = static_cast<uint32_t>(g_dw.size());
+}
+
+void dma_race_report() {
+  if(g_dr_snoop != 0) {
+    fprintf(stderr, "dmarace: %llu DMA chunks, %llu lines, %llu stale fills, %llu clobbers\n",
+            static_cast<unsigned long long>(g_dr_id), static_cast<unsigned long long>(g_dr_lines),
+            static_cast<unsigned long long>(g_dr_stale), static_cast<unsigned long long>(g_dr_clobbers));
+  }
+}
+
 void predecode_flush_all() {
   for(uint32_t ppn = 0; ppn < (1u << 20); ppn++) {
     if(g_code_page[ppn]) {
@@ -1936,11 +2213,17 @@ static inline uint32_t fc_word(uint32_t pc) {
 static __attribute__((noinline)) void fill_slot(dinst_t *di, uint32_t pc) {
   di->inst = fc_word(pc);
   di->fn = decode_insn(di->inst);
+  if(di->inst == 0x01000000u) {
+    /* the word before (same page only: a slot at offset 0 counts as not a delay slot) */
+    const bool ds = ((pc & 0xfffu) != 0) and is_cti(fc_word(pc - 4));
+    di->fn = ds ? op_nop<true> : op_nop<false>;
+  }
   *g_fc_codebit = 1;
 }
 
 static inline __attribute__((always_inline)) void exec_one(state_t *s) {
   if(not s->ext_irq and s->et and s->irl != 0 and (s->irl == 15 or s->irl > s->pil)) {
+    dma_race_interrupt(s);
     take_trap(s, TT_INTERRUPT_BASE + s->irl);
     return;
   }

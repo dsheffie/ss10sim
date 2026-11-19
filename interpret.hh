@@ -115,6 +115,9 @@ public:
   /* PSR, held unpacked; get_psr()/set_psr() pack it */
   bool icc_n = false, icc_z = false, icc_v = false, icc_c = false;
   bool ef = false, s = true, ps = false, et = false;
+  /* --no-fpu: no FPU present, so PSR.EF is hard-wired 0 (V8) and every FP
+   * instruction takes fp_disabled (superdupersparc/r9999 NO_FPU) */
+  bool no_fpu = false;
   uint32_t pil = 0;
   uint32_t cwp = 0;
   uint32_t wim = 0;
@@ -163,6 +166,10 @@ public:
    * per-instruction path is untouched; uicnt() adds the current user stretch */
   uint64_t uicnt_base = 0;   /* user insns retired before the current user stretch */
   uint64_t u_enter = 0;      /* icnt when user mode was last entered */
+  /* user-mode nops (sethi 0,%g0) and those in a CTI's delay slot: counted by
+   * the predecoded op_nop handlers only, --console-icount stamps them (bakeoff) */
+  uint64_t unop = 0;
+  uint64_t unop_ds = 0;
   uint64_t uicnt() const {
     return uicnt_base + (s ? 0 : icnt - u_enter);
   }
@@ -205,6 +212,17 @@ void mmu_tlb_flush();      /* empty the soft TLB (after any MMU state change mad
  * sun4m_t::dma_hook that empties the pages a DMA write covers */
 void predecode_flush_all();
 void predecode_dma_write(void *ctx, uint64_t pa, const uint8_t *buf, uint32_t len);
+/* the board DMA race model (interpret.cc): Kodiak's snoop / memcpy / snoop DMA
+ * write timeline in instructions (snoop_insns 0 = off); dma_race_snoop and
+ * dma_race_write are sun4m_t's dma_snoop and dma_hook (the latter also does
+ * predecode_dma_write) */
+void dma_race_config(uint64_t snoop_insns, uint64_t copy_insns, bool apply);
+void dma_race_snoop(void *ctx, uint64_t pa, uint32_t len);
+void dma_race_write(void *ctx, uint64_t pa, const uint8_t *buf, uint32_t len);
+void dma_race_report();
+/* --watch-pa: log every CPU access (and DMA write) to [pa, pa + len) */
+void watch_irq_at_pc(uint32_t pc);
+void watch_config(uint64_t pa, uint64_t len);
 /* the instruction at va as the CPU would fetch it now (no side effects); false
  * if it does not translate or is not in RAM/PROM */
 bool debug_fetch(state_t *s, uint32_t va, uint32_t *insn);

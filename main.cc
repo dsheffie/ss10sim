@@ -252,6 +252,14 @@ int main(int argc, char *argv[]) {
   std::string tcx_rom, fb_png, kbd_input;
   uint64_t kbd_input_at = 0;
   bool no_kbd = false;
+  bool no_fpu = false;
+  uint64_t dma_race_snoop_n = 0, dma_race_copy_n = 4;
+  bool dma_race_apply = false;
+  uint64_t scsi_cmd_us = 250;
+  bool no_esp_timing = false;
+  std::string esp_irq_at_pc_s;
+  std::string watch_pa_s;
+  uint64_t watch_len = 16;
   uint32_t cdrom_bs = 2048;
   uint64_t fb_png_every = 0;
   bool sdl = false, cg14 = false, console_icount = false;
@@ -300,6 +308,17 @@ int main(int argc, char *argv[]) {
       ("sdl", po::bool_switch(&sdl), "with --tcx: show the screen in an SDL window (closing it stops the run)")
       ("kbd-input", po::value<std::string>(&kbd_input),
        "with --tcx/--cg14: a file typed on the Sun keyboard (ASCII, US layout; \\n is Return, ^A-^Z are Control+letter)")
+      ("dma-race", po::value<uint64_t>(&dma_race_snoop_n),
+       "model Kodiak's snoop / memcpy / snoop DMA write with this many instructions per line snoop, and report "
+       "lines the core fills stale and dirties inside the window (interpret.cc)")
+      ("dma-race-copy", po::value<uint64_t>(&dma_race_copy_n), "with --dma-race: instructions per 16-byte line of the memcpy (default 4)")
+      ("watch-pa", po::value<std::string>(&watch_pa_s), "log every CPU access to this physical address range (hex), with pc and icnt")
+      ("watch-len", po::value<uint64_t>(&watch_len), "with --watch-pa: bytes to watch (default 16)")
+      ("scsi-cmd-us", po::value<uint64_t>(&scsi_cmd_us), "a SCSI target's command overhead in us (default 250): the ESP's interrupt waits for it")
+      ("no-esp-timing", po::bool_switch(&no_esp_timing), "the ESP interrupts as soon as the model finishes a command (qemu's behaviour)")
+      ("esp-irq-at-pc", po::value<std::string>(&esp_irq_at_pc_s), "dbg: hex pc; its store to the --watch-pa range releases a held ESP interrupt at once")
+      ("dma-race-apply", po::bool_switch(&dma_race_apply), "with --dma-race: write the old bytes back over a clobbered line, as the board would")
+      ("no-fpu", po::bool_switch(&no_fpu), "no FPU: PSR.EF reads 0, FP instructions take fp_disabled (a NO_FPU core)")
       ("no-kbd", po::bool_switch(&no_kbd), "with --tcx or --cg14: no keyboard (OBP falls back to ttya, like qemu -nographic)")
       ("kbd-input-at", po::value<uint64_t>(&kbd_input_at), "with --kbd-input: start typing at this icount")
       ("fb-png", po::value<std::string>(&fb_png), "with --tcx: write the screen to this PNG at exit")
@@ -328,7 +347,9 @@ int main(int argc, char *argv[]) {
   sparse_mem mem;
   state_t *s = new state_t(mem);
   s->user_emu = user;
+  s->no_fpu = no_fpu;
   initState(s);
+  s->ef = s->ef and not no_fpu;
   if(not rom.empty()) {
     /* sun4m power-on: PC 0 / nPC 4 in Viking boot mode; WIM=1 and PS=1 as qemu
      * resets them (architecturally undefined), so traces line up */
@@ -392,6 +413,7 @@ int main(int argc, char *argv[]) {
   if(not restore.empty() and not load_checkpoint(restore.c_str(), s)) {
     return 1;
   }
+  s->ef = s->ef and not no_fpu;
   /* the decoded-instruction cache trusts a filled slot: a restored RAM image
    * and every DMA write into RAM empty the slots they cover */
   predecode_flush_all();
@@ -399,6 +421,21 @@ int main(int argc, char *argv[]) {
   s->u_enter = s->icnt;
   if(s->sun4m) {
     s->sun4m->dma_hook = predecode_dma_write;
+    s->sun4m->esp_cmd_ns = scsi_cmd_us * 1000;
+    s->sun4m->esp_timing = not no_esp_timing;
+    if(not watch_pa_s.empty()) {
+      watch_config(std::stoull(watch_pa_s, nullptr, 16), watch_len);
+      if(not esp_irq_at_pc_s.empty()) {
+        watch_irq_at_pc(static_cast<uint32_t>(std::stoul(esp_irq_at_pc_s, nullptr, 16)));
+      }
+    }
+    if(dma_race_snoop_n != 0 or not watch_pa_s.empty()) {
+      dma_race_config(dma_race_snoop_n, dma_race_copy_n, dma_race_apply);
+      s->sun4m->dma_hook = dma_race_write;
+      s->sun4m->dma_hook_ctx = s;
+      s->sun4m->dma_snoop = dma_race_snoop;
+      s->sun4m->dma_snoop_ctx = s;
+    }
   }
   /* --console-input files, typed in turn: the next opens when one is used up */
   if(console_input_ats.size() > console_inputs.size()) {
@@ -617,6 +654,7 @@ int main(int argc, char *argv[]) {
   if(dump) {
     std::cerr << *s;
   }
+  dma_race_report();
   std::cerr << "ISS: executed " << n_exec << " instructions\n";
   std::cerr << "ISS: " << s->icnt << " insns, exit code " << s->exit_code
 	    << (s->error_mode ? " (error mode)" : "") << "\n";
