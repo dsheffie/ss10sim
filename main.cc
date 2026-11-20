@@ -225,7 +225,12 @@ static void system_reset(state_t *s) {
   s->y = 0;
   s->fsr = 0;
   s->fq_addr = s->fq_insn = 0;
-  s->mmu_ctrl = (s->mmu_ctrl & ~(MCR_E | MCR_NF)) | MCR_BMODE;
+  /* a module reset: the control register to its reset value (and boot mode),
+   * not just E/NF cleared as qemu does -- a real reset turns the caches,
+   * snooping and cacheable table walks off too, and an RTL core that kept
+   * them (superdupersparc mmu.sv) walked stale page tables in OBP after a
+   * reboot.  Context and table pointer are kept. */
+  s->mmu_ctrl = MCR_RESET | MCR_BMODE;
   mmu_tlb_flush();
   s->pc = 0;
   s->npc = 4;
