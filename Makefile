@@ -1,6 +1,6 @@
 UNAME_S = $(shell uname -s)
 
-OBJ = main.o interpret.o sun4m.o esp.o lance.o scsi.o tcx.o cg14.o display.o disassemble.o loadelf.o helper.o sparse_mem.o ckpt.o
+OBJ = main.o interpret.o sun4m.o esp.o lance.o dbri.o scsi.o tcx.o cg14.o display.o disassemble.o loadelf.o helper.o sparse_mem.o ckpt.o
 
 ifeq ($(UNAME_S),Linux)
 	CXX = clang++-20 -march=native -flto
