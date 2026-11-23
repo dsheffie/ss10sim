@@ -223,6 +223,7 @@ void dma_race_report();
 /* --watch-pa: log every CPU access (and DMA write) to [pa, pa + len) */
 void watch_irq_at_pc(uint32_t pc);
 void watch_config(uint64_t pa, uint64_t len);
+void vram_map_log_config(bool on);
 /* the instruction at va as the CPU would fetch it now (no side effects); false
  * if it does not translate or is not in RAM/PROM */
 bool debug_fetch(state_t *s, uint32_t va, uint32_t *insn);

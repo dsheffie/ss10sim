@@ -264,6 +264,7 @@ int main(int argc, char *argv[]) {
   bool no_esp_timing = false;
   std::string esp_irq_at_pc_s;
   std::string watch_pa_s;
+  bool vram_map_log = false;
   uint64_t watch_len = 16;
   uint32_t cdrom_bs = 2048;
   uint64_t fb_png_every = 0;
@@ -317,6 +318,7 @@ int main(int argc, char *argv[]) {
        "model Kodiak's snoop / memcpy / snoop DMA write with this many instructions per line snoop, and report "
        "lines the core fills stale and dirties inside the window (interpret.cc)")
       ("dma-race-copy", po::value<uint64_t>(&dma_race_copy_n), "with --dma-race: instructions per 16-byte line of the memcpy (default 4)")
+      ("vram-map-log", po::bool_switch(&vram_map_log), "print each distinct CPU translation onto the CG14 (VRAM/registers) once, with its PTE's C bit")
       ("watch-pa", po::value<std::string>(&watch_pa_s), "log every CPU access to this physical address range (hex), with pc and icnt")
       ("watch-len", po::value<uint64_t>(&watch_len), "with --watch-pa: bytes to watch (default 16)")
       ("scsi-cmd-us", po::value<uint64_t>(&scsi_cmd_us), "a SCSI target's command overhead in us (default 250): the ESP's interrupt waits for it")
@@ -424,6 +426,7 @@ int main(int argc, char *argv[]) {
   predecode_flush_all();
   s->uicnt_base = 0;             /* the user icount counts from here (a restore set S directly) */
   s->u_enter = s->icnt;
+  vram_map_log_config(vram_map_log);
   if(s->sun4m) {
     s->sun4m->dma_hook = predecode_dma_write;
     s->sun4m->esp_cmd_ns = scsi_cmd_us * 1000;

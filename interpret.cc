@@ -1,3 +1,5 @@
+#include <set>
+#include <tuple>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -420,6 +422,38 @@ static inline bool stlb_hit(const state_t *s, uint32_t asi, uint32_t va, acc_t a
   return false;
 }
 
+/* --vram-map-log: each distinct translation that lands on the CG14 (VRAM at
+ * 0xfc000000 + 64 MB, registers at 0x9c000000) is printed once, with its PTE's C
+ * bit: how each OS maps the framebuffer (cacheable or not) -- Kodiak puts the VRAM
+ * in DRAM behind the core's caches.  Hooked at the soft-TLB refill, so a TLB hit
+ * costs nothing; a bypass ASI (never cached) walks every time and is deduped. */
+static bool g_vram_log = false;
+static std::set<std::tuple<uint32_t, uint64_t, uint32_t, uint32_t, uint32_t>> g_vram_seen;
+void vram_map_log_config(bool on) {
+  g_vram_log = on;
+}
+static __attribute__((noinline)) void vram_map_note(state_t *s, uint32_t asi, uint32_t va, acc_t acc,
+						     uint64_t pa, uint32_t pte) {
+  const bool vram = (pa >= 0xfc000000ULL and pa < 0x100000000ULL);
+  const bool regs = (pa >= 0x9c000000ULL and pa < 0x9c007000ULL);
+  if(not vram and not regs) {
+    return;
+  }
+  const bool mmu_on = (s->mmu_ctrl & MCR_E) != 0;
+  const bool bypass = asi_is_bypass(asi) or not mmu_on;
+  /* the cacheability the access gets: the PTE's C with the MMU on, never a bypass */
+  const uint32_t c = bypass ? 0 : ((pte >> 7) & 1);
+  if(not g_vram_seen.insert(std::make_tuple(va >> 12, pa >> 12, bypass ? 0 : pte, asi,
+					    static_cast<uint32_t>(acc))).second) {
+    return;
+  }
+  fprintf(stderr, "vram-map: icnt %llu pc %08x %s va %08x pa %09llx pte %08x C=%u asi %02x %s%s\n",
+	  static_cast<unsigned long long>(s->icnt), s->pc, vram ? "vram" : "regs", va,
+	  static_cast<unsigned long long>(pa), bypass ? 0 : pte, c, asi,
+	  (acc == acc_t::store) ? "st" : (acc == acc_t::fetch) ? "fetch" : "ld",
+	  bypass ? " (bypass/MMU off)" : "");
+}
+
 static inline uint32_t mmu_xlate(state_t *s, uint32_t asi, uint32_t va, acc_t acc, uint64_t *pa) {
   if(__builtin_expect(stlb_hit(s, asi, va, acc, pa), 1)) {
     return FT_NONE;
@@ -428,6 +462,9 @@ static inline uint32_t mmu_xlate(state_t *s, uint32_t asi, uint32_t va, acc_t ac
   stlb_t &e = g_stlb[acc == acc_t::fetch][(va >> 12) & (STLB_SZ - 1)];
   uint32_t pte = 0;
   const uint32_t ft = mmu_xlate_slow(s, asi, va, acc, pa, &pte);
+  if(__builtin_expect(g_vram_log, false) and ft == FT_NONE) {
+    vram_map_note(s, asi, va, acc, *pa, pte);
+  }
   if(ft == FT_NONE and pte != 0) {
     e.tag = tag;
     e.ppage = *pa & ~0xfffULL;
